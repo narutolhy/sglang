@@ -1,5 +1,25 @@
-# test_hf_sglang_logprob_unittest.py
-import os
+"""Test original log probability alignment between SGLang and Hugging Face.
+
+This test suite verifies the correctness of the `origin_logprobs` output (temperature=1) in SGLang
+by comparing it against raw logit-based probabilities computed directly from a
+reference Hugging Face model.
+
+The test covers the following scenarios:
+- Next-token prediction: Verifies that the log probability of the next token from
+  SGLang matches the Hugging Face model.
+- Top-k logprobs: Ensures that the top-k original logprobs returned by SGLang are
+  consistent with Hugging Face outputs.
+- Specified token IDs: Confirms that the original logprobs for specific token IDs
+  match the values computed from Hugging Face logits.
+
+The test uses a fixed prompt and deterministic sampling configuration to ensure
+numerical consistency. All comparisons are performed within a small tolerance,
+to account for floating-point discrepancies.
+
+This ensures that SGLang faithfully exposes original model scores, which are
+critical for downstream applications like reranking, calibration, and debugging.
+"""
+
 import unittest
 
 import numpy as np
@@ -8,52 +28,36 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 # ------------------------- Configurable via env ------------------------- #
-MODEL_ID = os.environ.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
+MODEL_ID = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 PROMPTS = [
     "Hello, my name is",
     "The future of AI is",
     "The president of the United States is",
     "The capital of France is ",
 ]
-TOP_LOGPROBS_NUM = int(os.environ.get("TOP_LOGPROBS_NUM", "50"))
-FIRST_N_TOKEN_IDS = int(os.environ.get("FIRST_N_TOKEN_IDS", "10"))
-RTOL = float(os.environ.get("RTOL", "0.20"))
-ATOL = float(os.environ.get("ATOL", "0.00"))
+TOP_LOGPROBS_NUM = 50
+FIRST_N_TOKEN_IDS = 10
+RTOL = 0.20
+ATOL = 0.00
 # ------------------------------------------------
 
-torch.manual_seed(0)
+torch.manual_seed(1234)
 if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(0)
+    torch.cuda.manual_seed_all(1234)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
 
 
-def extract_sglang_outputs(output):
-    """
-    Normalize SGLang response to the fields we need.
-    Adjust the keys here if your local build differs.
-    """
-    meta = output["meta_info"]
-    return (
-        meta["input_token_logprobs"],
-        meta["input_top_logprobs"],
-        meta["input_token_ids_logprobs"],
-        meta["output_token_original_logprobs"],
-        meta["output_top_original_logprobs"],
-        meta["output_token_ids_original_logprobs"],
-        [a for _, a, _ in meta["output_token_original_logprobs"]],
-    )
-
-
-class TestHFVsSGLangLogprob(unittest.TestCase):
+class TestLogprob(unittest.TestCase):
     def setUp(self):
         # ----- HF side (float32 weights) -----
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, padding_side="right")
         self.hf_model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID, torch_dtype=torch.float32, device_map="auto"
-        ).eval()
+        )
 
         # ----- SGLang side -----
         self.sgl_engine = sgl.Engine(
@@ -104,24 +108,17 @@ class TestHFVsSGLangLogprob(unittest.TestCase):
 
             if isinstance(outputs, list):
                 outputs = outputs[0]
-
-            (
-                input_token_logprobs,
-                input_top_logprobs,
-                input_token_ids_logprobs,
-                output_token_logprobs,
-                output_top_logprobs,
-                output_token_ids_logprobs,
-                output_ids_sglang,
-            ) = extract_sglang_outputs(outputs)
+            meta = outputs["meta_info"]
+            output_token_logprobs = meta["output_token_original_logprobs"]
+            output_top_logprobs = meta["output_top_original_logprobs"]
+            output_token_ids_logprobs = meta["output_token_ids_original_logprobs"]
 
             # ---------- 3) Build SGLang tensors ----------
+            logprobs_vals, indices_vals, _ = zip(*output_token_logprobs)
             sgl_token_logprobs_tensor = torch.tensor(
-                [a for a, _, _ in output_token_logprobs], device=self.hf_model.device
+                logprobs_vals, device=self.hf_model.device
             )
-            sgl_indices_tensor = torch.tensor(
-                [b for _, b, _ in output_token_logprobs], device=self.hf_model.device
-            )
+            sgl_indices_tensor = torch.tensor(indices_vals, device=self.hf_model.device)
 
             # ---------- 5) Assertions ----------
             sgl_indices_tensor = sgl_indices_tensor.to(
