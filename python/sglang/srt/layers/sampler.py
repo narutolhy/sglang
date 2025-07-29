@@ -75,12 +75,7 @@ class Sampler(nn.Module):
             batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
-                if not is_temperatures_one:
-                    original_logprobs = torch.softmax(
-                        logits_output.next_token_logits, dim=-1
-                    )
-                else:
-                    original_logprobs = logprobs
+                original_logprobs = logprobs
 
         else:
             # Post process original logits
@@ -233,7 +228,7 @@ def get_top_logprobs(
     logprobs: torch.Tensor,
     original_logprobs: torch.Tensor,
     top_logprobs_nums: List[int],
-    is_temperture_one: bool,
+    is_temperatures_one: bool,
 ):
     max_k = max(top_logprobs_nums)
     ret = logprobs.topk(max_k, dim=1)
@@ -248,9 +243,9 @@ def get_top_logprobs(
     for i, k in enumerate(top_logprobs_nums):
         output_top_logprobs_val.append(values[i][:k])
         output_top_logprobs_idx.append(indices[i][:k])
-        if not is_temperture_one:
+        if not is_temperatures_one:
             output_top_original_logprobs_val.append(origin_values[i][:k])
-    if is_temperture_one:
+    if is_temperatures_one:
         output_top_original_logprobs_val = output_top_logprobs_val
     return (
         output_top_logprobs_val,
@@ -263,7 +258,7 @@ def get_token_ids_logprobs(
     logprobs: torch.Tensor,
     original_logprobs: torch.Tensor,
     token_ids_logprobs: List[List[int]],
-    is_temperture_one: bool,
+    is_temperatures_one: bool,
 ):
     output_token_ids_logprobs_val = []
     output_token_ids_logprobs_idx = []
@@ -272,17 +267,17 @@ def get_token_ids_logprobs(
         if token_ids is not None:
             output_token_ids_logprobs_val.append(logprobs[i, token_ids].tolist())
             output_token_ids_logprobs_idx.append(token_ids)
-            if not is_temperture_one:
+            if not is_temperatures_one:
                 output_token_ids_original_logprobs_val.append(
                     original_logprobs[i, token_ids].tolist()
                 )
         else:
             output_token_ids_logprobs_val.append([])
             output_token_ids_logprobs_idx.append([])
-            if not is_temperture_one:
+            if not is_temperatures_one:
                 output_token_ids_original_logprobs_val.append([])
-        if is_temperture_one:
-            output_token_ids_original_logprobs_val = output_token_ids_logprobs_val
+    if is_temperatures_one:
+        output_token_ids_original_logprobs_val = output_token_ids_logprobs_val
 
     return (
         output_token_ids_logprobs_val,
