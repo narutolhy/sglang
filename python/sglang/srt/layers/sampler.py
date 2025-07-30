@@ -56,6 +56,8 @@ class Sampler(nn.Module):
                 performs sampling in draft workers.
         """
         logits = logits_output.next_token_logits
+
+        # Temperature rescales logits (logits / temperature); only temperature = 1.0 leaves the model’s “true” log‑probs unchanged.
         is_temperatures_one = torch.all(sampling_info.temperatures == 1.0)
 
         # Apply the custom logit processors if registered in the sampling info.
@@ -80,10 +82,7 @@ class Sampler(nn.Module):
         else:
             # Post process original logits
             if not is_temperatures_one:
-                original_logits = logits.clone()
-                original_logits[:] = torch.softmax(original_logits, dim=-1)
-                original_logprobs = original_logits
-                del original_logits
+                original_logprobs = torch.softmax(logits, dim=-1)
 
             # Post process logits
             logits.div_(sampling_info.temperatures)
@@ -234,8 +233,8 @@ def get_top_logprobs(
     ret = logprobs.topk(max_k, dim=1)
     values = ret.values.tolist()
     indices = ret.indices.tolist()
-    origin_ret = original_logprobs.topk(max_k, dim=1)
-    origin_values = origin_ret.values.tolist()
+    original_ret = original_logprobs.topk(max_k, dim=1)
+    original_values = original_ret.values.tolist()
 
     output_top_logprobs_val = []
     output_top_logprobs_idx = []
@@ -244,7 +243,7 @@ def get_top_logprobs(
         output_top_logprobs_val.append(values[i][:k])
         output_top_logprobs_idx.append(indices[i][:k])
         if not is_temperatures_one:
-            output_top_original_logprobs_val.append(origin_values[i][:k])
+            output_top_original_logprobs_val.append(original_values[i][:k])
     if is_temperatures_one:
         output_top_original_logprobs_val = output_top_logprobs_val
     return (

@@ -81,6 +81,74 @@ class TestLogprob(unittest.TestCase):
         except Exception:
             pass
 
+    # ---------------------------------------------------------------------
+    # Helper: compare one SGLang block (token_logprobs / top_logprobs / ids_logprobs)
+    #         against a reference HF log‑prob vector.
+    # ---------------------------------------------------------------------
+    def assert_logprobs_block_equal(
+        self,
+        hf_log_probs: torch.Tensor,  # [V]
+        token_log_probs: list,  # List[Tuple(logprob, token_id, token_str)]
+        top_log_probs: list,  # List[List[…]] or List[…]
+        ids_log_probs: list,  # List[List[…]]
+        tag: str = "",  # label for error msg
+    ):
+        """
+        Performs three checks:
+        1. token‑level log‑probs   (for indices in `token_lp`)
+        2. top‑k log‑probs         (against `top_lp`)
+        3. first‑N token‑IDs lp    (against `ids_lp`)
+
+        Uses RTOL / ATOL constants defined at module scope.
+        """
+        # ------------ 1) token‑level ------------
+        vals, idxs, _ = zip(*token_log_probs)
+        sgl_vals = torch.tensor(vals, device=self.hf_model.device, dtype=torch.float32)
+        sgl_idxs = torch.tensor(idxs, device=self.hf_model.device, dtype=torch.long)
+        hf_vals = hf_log_probs[sgl_idxs]
+
+        self.assertTrue(
+            torch.allclose(hf_vals, sgl_vals, rtol=RTOL, atol=ATOL),
+            msg=f"[{tag}] token‑level mismatch at indices {sgl_idxs.tolist()}",
+        )
+
+        # ------------ 2) top‑k ------------
+        hf_topk, _ = torch.topk(hf_log_probs, k=TOP_LOGPROBS_NUM, dim=-1)
+
+        # accommodate one‑ or two‑layer structure from SGLang
+        step0 = (
+            top_log_probs[0]
+            if top_log_probs and isinstance(top_log_probs[0][0], (list, tuple))
+            else top_log_probs
+        )
+        sgl_topk = torch.tensor(
+            [float(t[0]) for t in step0 if t and t[0] is not None][:TOP_LOGPROBS_NUM],
+            dtype=torch.float32,
+            device=self.hf_model.device,
+        )
+
+        k = min(hf_topk.numel(), sgl_topk.numel())
+        self.assertTrue(
+            torch.allclose(hf_topk[:k], sgl_topk[:k], rtol=RTOL, atol=ATOL),
+            msg=f"[{tag}] top‑k mismatch",
+        )
+
+        # ------------ 3) token‑IDs ------------
+        hf_first = hf_log_probs[:FIRST_N_TOKEN_IDS]
+        sgl_first = torch.tensor(
+            [v for v, _, _ in ids_log_probs[0]],
+            device=self.hf_model.device,
+            dtype=torch.float32,
+        )
+        self.assertTrue(
+            torch.allclose(hf_first, sgl_first, rtol=RTOL, atol=ATOL),
+            msg=f"[{tag}] token‑IDs mismatch",
+        )
+
+        # Optional: print max abs diff for quick diagnostics
+        max_diff = torch.max(torch.abs(hf_vals - sgl_vals)).item()
+        print(f"[{tag}] max|diff| token‑level = {max_diff:.4f}")
+
     def test_logprob_match(self):
         for prompt in PROMPTS:
             # ---------- 1) HF forward pass ----------
@@ -95,7 +163,12 @@ class TestLogprob(unittest.TestCase):
                     return_dict=True,
                 )
             logits = hf_out.logits[:, -1, :]  # [1, V]
-            hf_log_probs = F.log_softmax(logits.float(), dim=-1)[0]  # [V]
+            hf_log_probs = F.log_softmax(
+                logits.float() / self.sampling_params["temperature"], dim=-1
+            )[
+                0
+            ]  # [V]
+            hf_original_log_probs = F.log_softmax(logits.float(), dim=-1)[0]  # [V]
 
             # ---------- 2) SGLang inference ----------
             outputs = self.sgl_engine.generate(
@@ -109,65 +182,23 @@ class TestLogprob(unittest.TestCase):
             if isinstance(outputs, list):
                 outputs = outputs[0]
             meta = outputs["meta_info"]
-            output_token_logprobs = meta["output_token_original_logprobs"]
-            output_top_logprobs = meta["output_top_original_logprobs"]
-            output_token_ids_logprobs = meta["output_token_ids_original_logprobs"]
 
-            # ---------- 3) Build SGLang tensors ----------
-            logprobs_vals, indices_vals, _ = zip(*output_token_logprobs)
-            sgl_token_logprobs_tensor = torch.tensor(
-                logprobs_vals, device=self.hf_model.device
-            )
-            sgl_indices_tensor = torch.tensor(indices_vals, device=self.hf_model.device)
-
-            # ---------- 5) Assertions ----------
-            sgl_indices_tensor = sgl_indices_tensor.to(
-                dtype=torch.long, device=hf_log_probs.device
-            )
-            hf_token_logprobs = hf_log_probs[sgl_indices_tensor]
-
-            self.assertTrue(
-                torch.allclose(
-                    hf_token_logprobs, sgl_token_logprobs_tensor, rtol=RTOL, atol=ATOL
-                ),
-                msg=f"Token logprobs differ over indices {sgl_indices_tensor.tolist()}",
+            # ---------- 3) Compare logprobs ----------
+            self.assert_logprobs_block_equal(
+                hf_log_probs=hf_log_probs,
+                token_log_probs=meta["output_token_logprobs"],
+                top_log_probs=meta["output_top_logprobs"],
+                ids_log_probs=meta["output_token_ids_logprobs"],
+                tag=f"logprobs SGLang vs HF: {prompt}",
             )
 
-            # ----- top‑k comparison -----
-            if output_top_logprobs is None:
-                raise ValueError("Engine response missing 'output_top_logprobs'.")
-
-            hf_topk_vals, _ = torch.topk(hf_log_probs, k=TOP_LOGPROBS_NUM, dim=-1)
-
-            sgl_topk_vals = torch.tensor(
-                [float(x[0][0]) for x in output_top_logprobs if x[0] is not None],
-                dtype=torch.float32,
-                device=hf_log_probs.device,
-            )
-
-            k_match = min(hf_topk_vals.numel(), sgl_topk_vals.numel())
-            hf_topk_vals = hf_topk_vals[:k_match]
-            sgl_topk_vals = sgl_topk_vals[:k_match]
-
-            self.assertTrue(
-                torch.allclose(hf_topk_vals, sgl_topk_vals, rtol=RTOL, atol=ATOL),
-                msg="Top‑k logprobs mismatch",
-            )
-
-            # ----- token_ids_logprob comparison -----
-            hf_first_ids = hf_log_probs[:FIRST_N_TOKEN_IDS]
-            sgl_first_ids = torch.tensor(
-                [a for a, _, _ in output_token_ids_logprobs[0]],
-                device=self.hf_model.device,
-            )
-            self.assertTrue(
-                torch.allclose(hf_first_ids, sgl_first_ids, rtol=RTOL, atol=ATOL),
-                msg="token_ids_logprob mismatch",
-            )
-
-            print(
-                f"[{prompt}] max|diff| token_logprob = "
-                f"{torch.max(torch.abs(hf_token_logprobs - sgl_token_logprobs_tensor)):.4f}"
+            # ---------- 4) Compare original logprobs ----------
+            self.assert_logprobs_block_equal(
+                hf_log_probs=hf_original_log_probs,
+                token_log_probs=meta["output_token_original_logprobs"],
+                top_log_probs=meta["output_top_original_logprobs"],
+                ids_log_probs=meta["output_token_ids_original_logprobs"],
+                tag=f"Original logprobs SGLang vs HF: {prompt}",
             )
 
 
