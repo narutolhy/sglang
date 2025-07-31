@@ -1,8 +1,8 @@
 """Test original log probability alignment between SGLang and Hugging Face.
 
-This test suite verifies the correctness of the `origin_logprobs` output (temperature=1) in SGLang
-by comparing it against raw logit-based probabilities computed directly from a
-reference Hugging Face model.
+This test suite verifies the correctness of the `origin_logprobs` output (temperature=1)
+and the `logprobs` output (temperature=0.5) in SGLang by comparing it against
+raw logit-based probabilities computed directly from a reference Hugging Face model.
 
 The test covers the following scenarios:
 - Next-token prediction: Verifies that the log probability of the next token from
@@ -11,15 +11,9 @@ The test covers the following scenarios:
   consistent with Hugging Face outputs.
 - Specified token IDs: Confirms that the original logprobs for specific token IDs
   match the values computed from Hugging Face logits.
-
-The test uses a fixed prompt and deterministic sampling configuration to ensure
-numerical consistency. All comparisons are performed within a small tolerance,
-to account for floating-point discrepancies.
-
-This ensures that SGLang faithfully exposes original model scores, which are
-critical for downstream applications like reranking, calibration, and debugging.
 """
 
+import random
 import unittest
 
 import numpy as np
@@ -39,7 +33,7 @@ PROMPTS = [
     "The capital of France is ",
 ]
 TOP_LOGPROBS_NUM = 50
-FIRST_N_TOKEN_IDS = 10
+NUM_RANDOM_TOKEN_IDS = 10
 RTOL = 0.20
 ATOL = 0.00
 # ------------------------------------------------
@@ -88,20 +82,12 @@ class TestLogprob(unittest.TestCase):
     def assert_logprobs_block_equal(
         self,
         hf_log_probs: torch.Tensor,  # [V]
-        token_log_probs: list,  # List[Tuple(logprob, token_id, token_str)]
-        top_log_probs: list,  # List[List[…]] or List[…]
-        ids_log_probs: list,  # List[List[…]]
-        tag: str = "",  # label for error msg
+        token_log_probs: list,
+        top_log_probs: list,
+        ids_log_probs: list,
+        random_token_ids: list,
+        tag: str = "",
     ):
-        """
-        Performs three checks:
-        1. token‑level log‑probs   (for indices in `token_lp`)
-        2. top‑k log‑probs         (against `top_lp`)
-        3. first‑N token‑IDs lp    (against `ids_lp`)
-
-        Uses RTOL / ATOL constants defined at module scope.
-        """
-        # ------------ 1) token‑level ------------
         vals, idxs, _ = zip(*token_log_probs)
         sgl_vals = torch.tensor(vals, device=self.hf_model.device, dtype=torch.float32)
         sgl_idxs = torch.tensor(idxs, device=self.hf_model.device, dtype=torch.long)
@@ -112,17 +98,12 @@ class TestLogprob(unittest.TestCase):
             msg=f"[{tag}] token‑level mismatch at indices {sgl_idxs.tolist()}",
         )
 
-        # ------------ 2) top‑k ------------
         hf_topk, _ = torch.topk(hf_log_probs, k=TOP_LOGPROBS_NUM, dim=-1)
 
-        # accommodate one‑ or two‑layer structure from SGLang
-        step0 = (
-            top_log_probs[0]
-            if top_log_probs and isinstance(top_log_probs[0][0], (list, tuple))
-            else top_log_probs
-        )
         sgl_topk = torch.tensor(
-            [float(t[0]) for t in step0 if t and t[0] is not None][:TOP_LOGPROBS_NUM],
+            [float(t[0]) for t in top_log_probs[0] if t and t[0] is not None][
+                :TOP_LOGPROBS_NUM
+            ],
             dtype=torch.float32,
             device=self.hf_model.device,
         )
@@ -133,15 +114,19 @@ class TestLogprob(unittest.TestCase):
             msg=f"[{tag}] top‑k mismatch",
         )
 
-        # ------------ 3) token‑IDs ------------
-        hf_first = hf_log_probs[:FIRST_N_TOKEN_IDS]
-        sgl_first = torch.tensor(
+        indices = torch.tensor(
+            random_token_ids, dtype=torch.long, device=hf_log_probs.device
+        )
+
+        hf_token_ids = hf_log_probs[indices]
+
+        sgl_token_ids = torch.tensor(
             [v for v, _, _ in ids_log_probs[0]],
             device=self.hf_model.device,
             dtype=torch.float32,
         )
         self.assertTrue(
-            torch.allclose(hf_first, sgl_first, rtol=RTOL, atol=ATOL),
+            torch.allclose(hf_token_ids, sgl_token_ids, rtol=RTOL, atol=ATOL),
             msg=f"[{tag}] token‑IDs mismatch",
         )
 
@@ -150,8 +135,13 @@ class TestLogprob(unittest.TestCase):
         print(f"[{tag}] max|diff| token‑level = {max_diff:.4f}")
 
     def test_logprob_match(self):
+        vocab_size = self.tokenizer.vocab_size
+
         for prompt in PROMPTS:
-            # ---------- 1) HF forward pass ----------
+            random_token_ids = sorted(
+                random.sample(range(vocab_size), NUM_RANDOM_TOKEN_IDS)
+            )
+
             enc = self.tokenizer(prompt, return_tensors="pt")
             input_ids = enc["input_ids"].to(self.hf_model.device)
             attn_mask = enc["attention_mask"].to(self.hf_model.device)
@@ -170,34 +160,33 @@ class TestLogprob(unittest.TestCase):
             ]  # [V]
             hf_original_log_probs = F.log_softmax(logits.float(), dim=-1)[0]  # [V]
 
-            # ---------- 2) SGLang inference ----------
             outputs = self.sgl_engine.generate(
                 input_ids=input_ids[0].tolist(),
                 sampling_params=self.sampling_params,
                 return_logprob=True,
                 top_logprobs_num=TOP_LOGPROBS_NUM,
-                token_ids_logprob=list(range(FIRST_N_TOKEN_IDS)),
+                token_ids_logprob=random_token_ids,
             )
 
             if isinstance(outputs, list):
                 outputs = outputs[0]
             meta = outputs["meta_info"]
 
-            # ---------- 3) Compare logprobs ----------
             self.assert_logprobs_block_equal(
                 hf_log_probs=hf_log_probs,
                 token_log_probs=meta["output_token_logprobs"],
                 top_log_probs=meta["output_top_logprobs"],
                 ids_log_probs=meta["output_token_ids_logprobs"],
+                random_token_ids=random_token_ids,
                 tag=f"logprobs SGLang vs HF: {prompt}",
             )
 
-            # ---------- 4) Compare original logprobs ----------
             self.assert_logprobs_block_equal(
                 hf_log_probs=hf_original_log_probs,
                 token_log_probs=meta["output_token_original_logprobs"],
                 top_log_probs=meta["output_top_original_logprobs"],
                 ids_log_probs=meta["output_token_ids_original_logprobs"],
+                random_token_ids=random_token_ids,
                 tag=f"Original logprobs SGLang vs HF: {prompt}",
             )
 

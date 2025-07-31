@@ -80,7 +80,7 @@ class Sampler(nn.Module):
                 original_logprobs = logprobs
 
         else:
-            # Post process original logits
+            # Post process original logits. if temperatures are all 1.0, no need to rescale
             if not is_temperatures_one:
                 original_logprobs = torch.softmax(logits, dim=-1)
 
@@ -242,10 +242,11 @@ def get_top_logprobs(
     for i, k in enumerate(top_logprobs_nums):
         output_top_logprobs_val.append(values[i][:k])
         output_top_logprobs_idx.append(indices[i][:k])
-        if not is_temperatures_one:
+        if is_temperatures_one:
+            output_top_original_logprobs_val.append(values[i][:k])
+        else:
             output_top_original_logprobs_val.append(original_values[i][:k])
-    if is_temperatures_one:
-        output_top_original_logprobs_val = output_top_logprobs_val
+
     return (
         output_top_logprobs_val,
         output_top_logprobs_idx,
@@ -266,17 +267,18 @@ def get_token_ids_logprobs(
         if token_ids is not None:
             output_token_ids_logprobs_val.append(logprobs[i, token_ids].tolist())
             output_token_ids_logprobs_idx.append(token_ids)
-            if not is_temperatures_one:
+            if is_temperatures_one:
+                output_token_ids_original_logprobs_val.append(
+                    logprobs[i, token_ids].tolist()
+                )
+            else:
                 output_token_ids_original_logprobs_val.append(
                     original_logprobs[i, token_ids].tolist()
                 )
         else:
             output_token_ids_logprobs_val.append([])
             output_token_ids_logprobs_idx.append([])
-            if not is_temperatures_one:
-                output_token_ids_original_logprobs_val.append([])
-    if is_temperatures_one:
-        output_token_ids_original_logprobs_val = output_token_ids_logprobs_val
+            output_token_ids_original_logprobs_val.append([])
 
     return (
         output_token_ids_logprobs_val,
