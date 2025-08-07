@@ -1138,6 +1138,7 @@ class TokenizerManager:
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
                     lora_path=obj.lora_path,
+                    pinned=obj.pinned,
                 )
 
                 # Trigger the actual loading operation at the backend processes.
@@ -1195,7 +1196,7 @@ class TokenizerManager:
 
                 return result
         except ValueError as e:
-            return UnloadLoRAAdapterReqOutput(success=False, rror_message=str(e))
+            return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
 
     async def get_weights_by_name(
         self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
