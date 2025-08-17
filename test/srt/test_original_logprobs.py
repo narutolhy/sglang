@@ -24,6 +24,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import sglang as sgl
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
+import os
+
 # ------------------------- Configurable via env ------------------------- #
 MODEL_ID = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 PROMPTS = [
@@ -45,8 +47,9 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = False
 
 
-class TestLogprob(unittest.TestCase):
+class TestOriginalLogprob(unittest.TestCase):
     def setUp(self):
+        os.environ["RETURN_ORIGINAL_LOGPROB"] = True  # Enable original logprobs
         # ----- HF side (float32 weights) -----
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, padding_side="right")
         self.hf_model = AutoModelForCausalLM.from_pretrained(

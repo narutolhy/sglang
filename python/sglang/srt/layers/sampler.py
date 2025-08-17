@@ -24,6 +24,7 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
+RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB", default=False)
 
 
 class Sampler(nn.Module):
@@ -57,9 +58,6 @@ class Sampler(nn.Module):
         """
         logits = logits_output.next_token_logits
 
-        # Temperature rescales logits (logits / temperature); only temperature = 1.0 leaves the model’s “true” log‑probs unchanged.
-        is_temperatures_one = torch.all(sampling_info.temperatures == 1.0)
-
         # Apply the custom logit processors if registered in the sampling info.
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
@@ -81,7 +79,7 @@ class Sampler(nn.Module):
 
         else:
             # Post process original logits. if temperatures are all 1.0, no need to rescale
-            if not is_temperatures_one:
+            if return_logprob and RETURN_ORIGINAL_LOGPROB:
                 original_logprobs = torch.softmax(logits, dim=-1)
 
             # Post process logits
@@ -121,14 +119,13 @@ class Sampler(nn.Module):
                     )
 
             if return_logprob:
+                original_logprobs = None
                 # clamp to avoid -inf
                 logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
-                if not is_temperatures_one:
+                if RETURN_ORIGINAL_LOGPROB:
                     original_logprobs = torch.log(original_logprobs).clamp(
                         min=torch.finfo(original_logprobs.dtype).min
                     )
-                else:
-                    original_logprobs = logprobs
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
@@ -138,7 +135,7 @@ class Sampler(nn.Module):
                     logits_output.next_token_top_logprobs_idx,
                     logits_output.next_token_top_original_logprobs_val,
                 ) = get_top_logprobs(
-                    logprobs, original_logprobs, top_logprobs_nums, is_temperatures_one
+                    logprobs, original_logprobs, top_logprobs_nums
                 )
 
             if any(x is not None for x in token_ids_logprobs):
@@ -147,7 +144,7 @@ class Sampler(nn.Module):
                     logits_output.next_token_token_ids_logprobs_idx,
                     logits_output.next_token_token_ids_original_logprobs_val,
                 ) = get_token_ids_logprobs(
-                    logprobs, original_logprobs, token_ids_logprobs, is_temperatures_one
+                    logprobs, original_logprobs, token_ids_logprobs
                 )
 
             logits_output.next_token_logprobs = logprobs[
@@ -226,8 +223,7 @@ def top_p_normalize_probs_torch(
 def get_top_logprobs(
     logprobs: torch.Tensor,
     original_logprobs: torch.Tensor,
-    top_logprobs_nums: List[int],
-    is_temperatures_one: bool,
+    top_logprobs_nums: List[int]
 ):
     max_k = max(top_logprobs_nums)
     ret = logprobs.topk(max_k, dim=1)
@@ -242,9 +238,7 @@ def get_top_logprobs(
     for i, k in enumerate(top_logprobs_nums):
         output_top_logprobs_val.append(values[i][:k])
         output_top_logprobs_idx.append(indices[i][:k])
-        if is_temperatures_one:
-            output_top_original_logprobs_val.append(values[i][:k])
-        else:
+        if original_logprobs is not None:
             output_top_original_logprobs_val.append(original_values[i][:k])
 
     return (
@@ -258,7 +252,6 @@ def get_token_ids_logprobs(
     logprobs: torch.Tensor,
     original_logprobs: torch.Tensor,
     token_ids_logprobs: List[List[int]],
-    is_temperatures_one: bool,
 ):
     output_token_ids_logprobs_val = []
     output_token_ids_logprobs_idx = []
@@ -267,11 +260,7 @@ def get_token_ids_logprobs(
         if token_ids is not None:
             output_token_ids_logprobs_val.append(logprobs[i, token_ids].tolist())
             output_token_ids_logprobs_idx.append(token_ids)
-            if is_temperatures_one:
-                output_token_ids_original_logprobs_val.append(
-                    logprobs[i, token_ids].tolist()
-                )
-            else:
+            if original_logprobs is not None:
                 output_token_ids_original_logprobs_val.append(
                     original_logprobs[i, token_ids].tolist()
                 )

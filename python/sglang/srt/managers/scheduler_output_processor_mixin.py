@@ -269,9 +269,10 @@ class SchedulerOutputProcessorMixin:
                     req.output_top_logprobs_idx.append(
                         logits_output.next_token_top_logprobs_idx[i]
                     )
-                    req.output_top_original_logprobs_val.append(
-                        logits_output.next_token_top_original_logprobs_val[i]
-                    )
+                    if len(logits_output.next_token_top_original_logprobs_val) > 0:
+                        req.output_top_original_logprobs_val.append(
+                            logits_output.next_token_top_original_logprobs_val[i]
+                        )
                 if req.token_ids_logprob is not None:
                     req.output_token_ids_logprobs_val.append(
                         logits_output.next_token_token_ids_logprobs_val[i]
@@ -279,9 +280,10 @@ class SchedulerOutputProcessorMixin:
                     req.output_token_ids_logprobs_idx.append(
                         logits_output.next_token_token_ids_logprobs_idx[i]
                     )
-                    req.output_token_ids_original_logprobs_val.append(
-                        logits_output.next_token_token_ids_original_logprobs_val[i]
-                    )
+                    if len(logits_output.next_token_token_ids_original_logprobs_val) > 0:
+                        req.output_token_ids_original_logprobs_val.append(
+                            logits_output.next_token_token_ids_original_logprobs_val[i]
+                        )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(
@@ -469,9 +471,10 @@ class SchedulerOutputProcessorMixin:
         if req.top_logprobs_num > 0:
             req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
             req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
-            req.output_top_original_logprobs_val.append(
-                output.next_token_top_original_logprobs_val[i]
-            )
+            if len(output.next_token_top_original_logprobs_val) > 0:
+                req.output_top_original_logprobs_val.append(
+                    output.next_token_top_original_logprobs_val[i]
+                )
 
         if req.token_ids_logprob is not None:
             req.output_token_ids_logprobs_val.append(
@@ -480,9 +483,10 @@ class SchedulerOutputProcessorMixin:
             req.output_token_ids_logprobs_idx.append(
                 output.next_token_token_ids_logprobs_idx[i]
             )
-            req.output_token_ids_original_logprobs_val.append(
-                output.next_token_token_ids_original_logprobs_val[i]
-            )
+            if len(output.next_token_token_ids_original_logprobs_val) > 0:
+                req.output_token_ids_original_logprobs_val.append(
+                    output.next_token_token_ids_original_logprobs_val[i]
+                )
 
         return num_input_logprobs
 
