@@ -13,6 +13,7 @@ The test covers the following scenarios:
   match the values computed from Hugging Face logits.
 """
 
+import os
 import random
 import unittest
 
@@ -23,8 +24,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-
-import os
 
 # ------------------------- Configurable via env ------------------------- #
 MODEL_ID = DEFAULT_SMALL_MODEL_NAME_FOR_TEST

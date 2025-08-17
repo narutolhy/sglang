@@ -47,10 +47,9 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    get_bool_env_var,
     is_cuda,
     next_power_of_2,
-    get_bool_env_var,
-
 )
 
 if is_cuda():
@@ -58,6 +57,7 @@ if is_cuda():
 
 logger = logging.getLogger(__name__)
 RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB", default=False)
+
 
 @contextmanager
 def draft_tp_context(tp_group: GroupCoordinator):

@@ -280,7 +280,10 @@ class SchedulerOutputProcessorMixin:
                     req.output_token_ids_logprobs_idx.append(
                         logits_output.next_token_token_ids_logprobs_idx[i]
                     )
-                    if len(logits_output.next_token_token_ids_original_logprobs_val) > 0:
+                    if (
+                        len(logits_output.next_token_token_ids_original_logprobs_val)
+                        > 0
+                    ):
                         req.output_token_ids_original_logprobs_val.append(
                             logits_output.next_token_token_ids_original_logprobs_val[i]
                         )

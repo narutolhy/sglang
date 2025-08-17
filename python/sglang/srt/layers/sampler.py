@@ -134,9 +134,7 @@ class Sampler(nn.Module):
                     logits_output.next_token_top_logprobs_val,
                     logits_output.next_token_top_logprobs_idx,
                     logits_output.next_token_top_original_logprobs_val,
-                ) = get_top_logprobs(
-                    logprobs, original_logprobs, top_logprobs_nums
-                )
+                ) = get_top_logprobs(logprobs, original_logprobs, top_logprobs_nums)
 
             if any(x is not None for x in token_ids_logprobs):
                 (
@@ -223,7 +221,7 @@ def top_p_normalize_probs_torch(
 def get_top_logprobs(
     logprobs: torch.Tensor,
     original_logprobs: torch.Tensor,
-    top_logprobs_nums: List[int]
+    top_logprobs_nums: List[int],
 ):
     max_k = max(top_logprobs_nums)
     ret = logprobs.topk(max_k, dim=1)
