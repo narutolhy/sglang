@@ -267,6 +267,8 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     if need_min_p_sampling:
         min_p_thresholds = probs_sort[:, 0] * min_ps
         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+        probs_sort = torch.nn.functional.normalize(probs_sort, p=1, dim=-1)
+        probs.zero_().scatter_(1, probs_idx.long(), probs_sort)
     if sampling_seed is not None:
         sampled_index = multinomial_with_seed(probs_sort, sampling_seed, positions)
     else:
