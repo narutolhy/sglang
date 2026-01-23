@@ -69,6 +69,11 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.utils.usage_lib import (
+    UsageContext,
+    is_usage_stats_enabled,
+    report_usage_stats,
+)
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
@@ -193,6 +198,21 @@ class Engine(EngineBase):
             elif server_args.disaggregation_mode == "decode":
                 thread_label = "Decode Tokenizer"
             trace_set_thread_info(thread_label)
+
+        # Report usage statistics (only on master node)
+        if server_args.node_rank == 0 and is_usage_stats_enabled():
+            model_arch = "unknown"
+            if (
+                self.tokenizer_manager.model_config
+                and self.tokenizer_manager.model_config.hf_config
+                and self.tokenizer_manager.model_config.hf_config.architectures
+            ):
+                model_arch = self.tokenizer_manager.model_config.hf_config.architectures[0]
+            report_usage_stats(
+                server_args=server_args,
+                model_architecture=model_arch,
+                usage_context=UsageContext.ENGINE_CONTEXT,
+            )
 
         try:
             self.loop = asyncio.get_running_loop()

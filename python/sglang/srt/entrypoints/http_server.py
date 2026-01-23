@@ -58,6 +58,11 @@ from sglang.srt.entrypoints.engine import (
     run_detokenizer_process,
     run_scheduler_process,
 )
+from sglang.srt.utils.usage_lib import (
+    UsageContext,
+    is_usage_stats_enabled,
+    report_usage_stats,
+)
 from sglang.srt.entrypoints.ollama.protocol import (
     OllamaChatRequest,
     OllamaGenerateRequest,
@@ -1742,6 +1747,21 @@ def launch_server(
             remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
         )
     )
+
+    # Report usage statistics (only on master node)
+    if server_args.node_rank == 0 and is_usage_stats_enabled():
+        model_arch = "unknown"
+        if (
+            tokenizer_manager.model_config
+            and tokenizer_manager.model_config.hf_config
+            and tokenizer_manager.model_config.hf_config.architectures
+        ):
+            model_arch = tokenizer_manager.model_config.hf_config.architectures[0]
+        report_usage_stats(
+            server_args=server_args,
+            model_architecture=model_arch,
+            usage_context=UsageContext.OPENAI_API_SERVER,
+        )
 
     if server_args.enable_metrics:
         add_prometheus_track_response_middleware(app)
