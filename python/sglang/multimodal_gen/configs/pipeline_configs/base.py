@@ -53,6 +53,7 @@ class ModelTaskType(Enum):
     T2I = auto()  # Text to Image
     I2I = auto()  # Image to Image
     TI2I = auto()  # Image to Image or Text-Image to Image
+    I2M = auto()  # Image to Mesh
 
     def is_image_gen(self) -> bool:
         return (
@@ -62,7 +63,11 @@ class ModelTaskType(Enum):
         )
 
     def requires_image_input(self) -> bool:
-        return self == ModelTaskType.I2V or self == ModelTaskType.I2I
+        return (
+            self == ModelTaskType.I2V
+            or self == ModelTaskType.I2I
+            or self == ModelTaskType.I2M
+        )
 
     def accepts_image_input(self) -> bool:
         return (
@@ -70,9 +75,12 @@ class ModelTaskType(Enum):
             or self == ModelTaskType.I2I
             or self == ModelTaskType.TI2I
             or self == ModelTaskType.TI2V
+            or self == ModelTaskType.I2M
         )
 
     def data_type(self) -> DataType:
+        if self == ModelTaskType.I2M:
+            return DataType.MESH
         if self.is_image_gen():
             return DataType.IMAGE
         else:
@@ -153,6 +161,7 @@ class PipelineConfig:
     """The base configuration class for a generation pipeline."""
 
     task_type: ModelTaskType = ModelTaskType.I2I
+    skip_input_image_preprocess: bool = False
 
     model_path: str = ""
     pipeline_config_path: str | None = None
@@ -343,9 +352,9 @@ class PipelineConfig:
 
     def shard_latents_for_sp(self, batch, latents):
         # general logic for video models
-        if batch.enable_sequence_shard:
-            return latents, False
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
+        if batch.enable_sequence_shard and sp_world_size > 1:
+            return latents, False
         if latents.dim() != 5:
             return latents, False
         time_dim = latents.shape[2]
@@ -599,6 +608,12 @@ class PipelineConfig:
             # 1.5. Adjust pipeline config for fine-tuned VAE if needed
             pipeline_config_cls = model_info.pipeline_config_cls
         vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
+        if vae_path is None:
+            component_paths = kwargs.get(
+                prefix_with_dot + "component_paths"
+            ) or kwargs.get("component_paths")
+            if isinstance(component_paths, dict):
+                vae_path = component_paths.get("vae")
 
         # Check if this is a Flux2 model with fal/FLUX.2-Tiny-AutoEncoder
         if (

@@ -15,7 +15,6 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
-    FlashInferFusedMoE,
     FusedMoE,
     moe_forward_piecewise_cuda_graph_impl,
 )
@@ -30,6 +29,9 @@ from sglang.srt.layers.moe.token_dispatcher.moriep import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsFusedMoEMethod,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
 )
@@ -384,7 +386,11 @@ class DeepEPMoE(FusedMoE):
             else:
                 input_quant = get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT")
                 if not input_quant and not isinstance(
-                    self.quant_method, NPUCompressedTensorsW4A16Int4DynamicMoE
+                    self.quant_method,
+                    (
+                        NPUCompressedTensorsW4A16Int4DynamicMoE,
+                        CompressedTensorsFusedMoEMethod,
+                    ),
                 ):
                     hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
                         hidden_states
@@ -735,7 +741,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
             or quant_config.get_name() == "compressed_tensors"
         ):
             # FlashInferFusedMoE support bf16, fp8 and compressed_tensors
-            return FlashInferFusedMoE
+            return FusedMoE
 
     if get_moe_runner_backend().is_flashinfer_cutlass():
         return FusedMoE
