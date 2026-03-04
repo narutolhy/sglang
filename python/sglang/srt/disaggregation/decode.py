@@ -344,6 +344,24 @@ class DecodePreallocQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        # Pass KV pool tensor refs for staging buffer scatter on decode side
+        if (
+            hasattr(kv_manager, "enable_staging")
+            and kv_manager.enable_staging
+            and hasattr(kv_manager, "set_kv_buffer_tensors")
+            and not self.is_mla_backend
+        ):
+            kv_pool = self.token_to_kv_pool
+            if hasattr(kv_pool, "full_kv_pool"):
+                kv_pool = kv_pool.full_kv_pool
+            if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
+                kv_manager.set_kv_buffer_tensors(
+                    kv_pool.k_buffer, kv_pool.v_buffer, kv_pool.page_size,
+                )
+            # Prefill uses tp_size with dp_size=1, so prefill_attn_tp = tp_size.
+            # Decode and prefill share the same tp_size (same GPU count per node).
+            kv_manager.prefill_attn_tp_size = self.tp_size
+        self.scheduler._decode_kv_manager = kv_manager
         return kv_manager
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
@@ -823,13 +841,15 @@ class DecodeTransferQueue:
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
 
-        # Validate bootstrap_room to detect context corruption
+        # Validate bootstrap_room to detect context corruption.
+        # Apply same int64 mask as set_buf() for consistent comparison.
         actual_room = output_bootstrap_room[0].item()
-        expected_room = (
+        raw_room = (
             decode_req.req.bootstrap_room
             if decode_req.req.bootstrap_room is not None
             else 0
         )
+        expected_room = raw_room & 0x7FFFFFFFFFFFFFFF
 
         if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
             pass
@@ -884,6 +904,134 @@ class DecodeTransferQueue:
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return True
 
+    def _submit_scatter_staging(self, decode_req: DecodeRequest) -> int:
+        """Submit scatter kernels to scatter_stream without synchronizing.
+
+        Returns the alloc_id (>= 0) if scatter was submitted,
+        or -1 if no scatter is needed for this request.
+        The caller tracks completion via CUDA events.
+        """
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+            return -1
+
+        kv_manager = getattr(self.scheduler, "_decode_kv_manager", None)
+        if kv_manager is None:
+            return -1
+        staging_allocator = getattr(kv_manager, "staging_allocator", None)
+        if staging_allocator is None:
+            return -1
+
+        receiver = decode_req.kv_receiver
+        staging_offset = getattr(receiver, "staging_offset", -1)
+        alloc_id = getattr(receiver, "staging_alloc_id", -1)
+        if staging_offset < 0 or alloc_id < 0:
+            return -1
+
+        kv_buffer_info = getattr(kv_manager, "kv_buffer_tensors", None)
+        if kv_buffer_info is None:
+            staging_allocator.free(alloc_id)
+            return -1
+
+        from sglang.srt.disaggregation.common.staging import (
+            compute_head_slice_params,
+            scatter_kv_head_slices,
+        )
+
+        prefill_attn_tp_size = getattr(kv_manager, "prefill_attn_tp_size", 0)
+        decode_attn_tp_size = kv_manager.attn_tp_size
+        if prefill_attn_tp_size == 0 or prefill_attn_tp_size == decode_attn_tp_size:
+            return -1
+
+        k_buffers = kv_buffer_info["k_buffers"]
+        v_buffers = kv_buffer_info["v_buffers"]
+        page_size = kv_buffer_info["page_size"]
+        num_layers = len(k_buffers)
+        head_dim = k_buffers[0].shape[-1]
+        dtype_size = k_buffers[0].element_size()
+
+        total_kv_heads = getattr(kv_manager.kv_args, "total_kv_head_num", 0)
+        if total_kv_heads <= 0:
+            decode_heads_per_rank = k_buffers[0].shape[1]
+            total_kv_heads = decode_heads_per_rank * decode_attn_tp_size
+
+        dst_tp_rank = kv_manager.kv_args.engine_rank % decode_attn_tp_size
+
+        req = decode_req.req
+        seq_len = len(req.origin_input_ids)
+        req_pool_idx = req.req_pool_idx
+        kv_indices = self.scheduler.req_to_token_pool.req_to_token[
+            req_pool_idx, :seq_len
+        ]
+        if page_size > 1:
+            from sglang.srt.disaggregation.utils import kv_to_page_indices
+            kv_indices = kv_to_page_indices(kv_indices.cpu().numpy(), page_size)
+            page_idx_tensor = torch.from_numpy(kv_indices).to(k_buffers[0].device)
+        else:
+            page_idx_tensor = kv_indices.to(k_buffers[0].device)
+
+        num_tokens = page_idx_tensor.shape[0] * page_size
+
+        if prefill_attn_tp_size > decode_attn_tp_size:
+            num_writers = prefill_attn_tp_size // max(1, decode_attn_tp_size)
+        else:
+            num_writers = 1
+
+        staging_view = staging_allocator.buffer.buffer
+        # Offset into the staging buffer for this request
+        req_offset = staging_offset
+        staging_view = staging_view[req_offset:]
+
+        if not hasattr(staging_allocator, "_scatter_stream"):
+            staging_allocator._scatter_stream = torch.cuda.Stream()
+
+        with torch.cuda.stream(staging_allocator._scatter_stream):
+            for writer_rank in range(num_writers):
+                _, num_heads, dst_head_start, _ = compute_head_slice_params(
+                    prefill_attn_tp_size, decode_attn_tp_size,
+                    writer_rank, dst_tp_rank, total_kv_heads,
+                )
+
+                per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
+                per_rank_bytes = per_layer_bytes * num_layers * 2
+                rank_base = writer_rank * per_rank_bytes
+
+                offset = rank_base
+                for layer_id in range(num_layers):
+                    layer_data = staging_view[offset:offset + per_layer_bytes].view(
+                        k_buffers[layer_id].dtype
+                    ).reshape(num_tokens, num_heads, head_dim)
+                    scatter_kv_head_slices(
+                        layer_data, k_buffers[layer_id],
+                        page_idx_tensor, dst_head_start, num_heads, page_size,
+                    )
+                    offset += per_layer_bytes
+                for layer_id in range(num_layers):
+                    layer_data = staging_view[offset:offset + per_layer_bytes].view(
+                        v_buffers[layer_id].dtype
+                    ).reshape(num_tokens, num_heads, head_dim)
+                    scatter_kv_head_slices(
+                        layer_data, v_buffers[layer_id],
+                        page_idx_tensor, dst_head_start, num_heads, page_size,
+                    )
+                    offset += per_layer_bytes
+
+        return alloc_id
+
+    def _complete_async_scatter(self, decode_req: DecodeRequest) -> None:
+        """Free staging allocation and ensure memory visibility for a completed scatter."""
+        kv_manager = getattr(self.scheduler, "_decode_kv_manager", None)
+        staging_allocator = getattr(kv_manager, "staging_allocator", None) if kv_manager else None
+        if staging_allocator is not None:
+            kv_buffer_info = getattr(kv_manager, "kv_buffer_tensors", None)
+            if kv_buffer_info is not None:
+                device = kv_buffer_info["k_buffers"][0].device
+                torch.cuda.default_stream(device).wait_event(decode_req._scatter_event)
+            staging_allocator.free(decode_req._scatter_alloc_id)
+        decode_req._scatter_event = None
+        decode_req._scatter_alloc_id = -1
+
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
@@ -896,6 +1044,30 @@ class DecodeTransferQueue:
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
+
+            # Check if this request has a pending async scatter from a previous iteration.
+            pending_event = getattr(decode_req, "_scatter_event", None)
+            if pending_event is not None:
+                if not pending_event.query():
+                    continue  # Scatter still running on GPU, check next iteration.
+                self._complete_async_scatter(decode_req)
+                # Scatter done — go directly to commit, skip scatter submission below.
+                should_remove = self._commit_transfer_to_req(decode_req)
+                if should_remove:
+                    indices_to_remove.add(i)
+                    if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                        self.scheduler.stream_output(
+                            [decode_req.req], decode_req.req.return_logprob
+                        )
+                        release_kv_cache(
+                            decode_req.req, self.tree_cache, is_insert=False
+                        )
+                        if self.scheduler.enable_metrics:
+                            self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+                    else:
+                        transferred_reqs.append(decode_req.req)
+                continue
+
             if poll == KVPoll.Failed:
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -911,17 +1083,27 @@ class DecodeTransferQueue:
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
-                # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
+                slot_id = self._submit_scatter_staging(decode_req)
+                if slot_id >= 0:
+                    kv_manager = getattr(self.scheduler, "_decode_kv_manager", None)
+                    staging_allocator = getattr(kv_manager, "staging_allocator", None) if kv_manager else None
+                    scatter_stream = getattr(staging_allocator, "_scatter_stream", None) if staging_allocator else None
+                    event = torch.cuda.Event()
+                    if scatter_stream is not None:
+                        event.record(scatter_stream)
+                    decode_req._scatter_event = event
+                    decode_req._scatter_alloc_id = slot_id
+                    continue
+                # No scatter needed (or slot_id < 0) — commit immediately.
                 should_remove = self._commit_transfer_to_req(decode_req)
                 if should_remove:
                     indices_to_remove.add(i)
-                    # Check if request was aborted due to corruption
                     if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                         self.scheduler.stream_output(
                             [decode_req.req], decode_req.req.return_logprob

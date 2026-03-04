@@ -278,6 +278,11 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
 
+    # Staging buffer for heterogeneous TP KV transfer
+    SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
+    SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)
+    SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
