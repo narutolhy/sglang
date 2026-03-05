@@ -986,6 +986,13 @@ class DecodeTransferQueue:
         if not hasattr(staging_allocator, "_scatter_stream"):
             staging_allocator._scatter_stream = torch.cuda.Stream()
 
+        # RDMA ordering barrier: per NVIDIA GPUDirect RDMA §2.7, GPU kernels
+        # may observe stale data from third-party DMA writes until a CPU-initiated
+        # CUDA memory operation establishes ordering. A single .item() (which does
+        # cudaMemcpyDeviceToHost internally) satisfies this requirement for ALL
+        # prior DMA writes, replacing the heavy torch.cuda.synchronize().
+        staging_view[0].item()
+
         with torch.cuda.stream(staging_allocator._scatter_stream):
             for writer_rank in range(num_writers):
                 _, num_heads, dst_head_start, _ = compute_head_slice_params(
