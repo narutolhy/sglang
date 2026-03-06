@@ -72,6 +72,8 @@ class TransferInfo:
     is_dummy: bool
     staging_offset: int = -1  # byte offset into decode staging buffer (-1 = not allocated)
     staging_alloc_id: int = -1  # allocator ID for freeing
+    staging_round: int = 0  # ring buffer round number
+    staging_end: int = -1  # offset + size (end of allocated region)
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -93,6 +95,16 @@ class TransferInfo:
             if len(msg) > 8 and msg[8] != b""
             else -1
         )
+        staging_round = (
+            int(msg[9].decode("ascii"))
+            if len(msg) > 9 and msg[9] != b""
+            else 0
+        )
+        staging_end = (
+            int(msg[10].decode("ascii"))
+            if len(msg) > 10 and msg[10] != b""
+            else -1
+        )
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -104,6 +116,8 @@ class TransferInfo:
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
             staging_offset=staging_offset,
+            staging_round=staging_round,
+            staging_end=staging_end,
         )
 
 
@@ -201,6 +215,7 @@ class MooncakeKVManager(CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
+            self.remote_watermark = (0, 0)  # (round, tail_offset) from decode
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -1030,6 +1045,26 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                             )
                         elif use_staging:
+                            # Wait until the target region from the PREVIOUS
+                            # round has been freed (scatter completed on decode).
+                            # watermark = (wm_round, wm_tail) means: everything
+                            # in rounds < wm_round is freed, and in wm_round
+                            # everything with offset < wm_tail is freed.
+                            #
+                            # This req at (req_round, req_offset) overwrites the
+                            # same physical region used by (req_round-1, req_offset).
+                            # Safe to write iff that previous-round region is freed.
+                            req_round = req.staging_round
+                            req_end = req.staging_end
+                            while req_round > 0:
+                                wm_round, wm_tail = self.remote_watermark
+                                prev_round = req_round - 1
+                                if prev_round < wm_round:
+                                    break  # Entire prev round freed
+                                if prev_round == wm_round and req_end <= wm_tail:
+                                    break  # Prev round, region fully freed
+                                time.sleep(0.001)
+
                             dst_staging_ptr = (
                                 target_rank_registration_info.dst_staging_base_ptr
                                 + req.staging_offset
@@ -1159,7 +1194,12 @@ class MooncakeKVManager(CommonKVManager):
                 waiting_req_bytes = self.server_socket.recv_multipart()
                 room = waiting_req_bytes[0].decode("ascii")
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
-                if room == "None":
+                if room == "WATERMARK":
+                    wm_round = int(waiting_req_bytes[1].decode("ascii"))
+                    wm_tail = int(waiting_req_bytes[2].decode("ascii"))
+                    self.remote_watermark = (wm_round, wm_tail)
+                    continue
+                elif room == "None":
                     self.decode_kv_args_table[mooncake_session_id] = (
                         KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     )
@@ -1540,6 +1580,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
         staging_allocator = getattr(self.kv_mgr, "staging_allocator", None)
         self.staging_offset = -1
         self.staging_alloc_id = -1
+        self.staging_round = 0
+        self.staging_end = -1
         if staging_allocator is not None:
             # Compute required staging bytes from kv_item_lens (always available).
             # kv_item_lens = [k_layer0_item, ..., k_layerN_item, v_layer0_item, ..., v_layerN_item]
@@ -1567,11 +1609,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
             result = staging_allocator.assign(required_bytes)
             if result is not None:
-                self.staging_alloc_id, self.staging_offset = result
+                self.staging_alloc_id, self.staging_offset, self.staging_round = result
+                self.staging_end = self.staging_offset + required_bytes
             else:
                 logger.warning_once(
-                    f"[Staging] allocator full: need {required_bytes} bytes, "
-                    f"used {staging_allocator.free_offset}/{staging_allocator.total_size}"
+                    f"[Staging] allocator returned None: need {required_bytes} bytes"
                 )
 
         for bootstrap_info in self.bootstrap_infos:
@@ -1597,6 +1639,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
                         str(self.staging_offset).encode("ascii"),
+                        str(self.staging_round).encode("ascii"),
+                        str(self.staging_end).encode("ascii"),
                     ]
                 )
         self.init_time = time.time()

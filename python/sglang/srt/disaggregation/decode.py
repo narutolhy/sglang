@@ -1036,6 +1036,21 @@ class DecodeTransferQueue:
                 device = kv_buffer_info["k_buffers"][0].device
                 torch.cuda.default_stream(device).wait_event(decode_req._scatter_event)
             staging_allocator.free(decode_req._scatter_alloc_id)
+            # Send watermark update to prefill via the receiver's bootstrap connection
+            receiver = decode_req.kv_receiver
+            if receiver is not None and hasattr(receiver, "bootstrap_infos") and receiver.bootstrap_infos:
+                wm_round, wm_tail = staging_allocator.get_watermark()
+                for bootstrap_info in receiver.bootstrap_infos:
+                    try:
+                        sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
+                        with lock:
+                            sock.send_multipart([
+                                b"WATERMARK",
+                                str(wm_round).encode("ascii"),
+                                str(wm_tail).encode("ascii"),
+                            ])
+                    except Exception:
+                        pass  # Best-effort; prefill will eventually see the update
         decode_req._scatter_event = None
         decode_req._scatter_alloc_id = -1
 

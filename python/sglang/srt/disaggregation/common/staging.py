@@ -125,14 +125,18 @@ class RecvSlotPool:
 
 
 class StagingAllocator:
-    """Decode-side dynamic staging ring buffer allocator.
+    """Decode-side dynamic staging ring buffer allocator with overcommit.
 
     One large pre-allocated GPU buffer used as a ring buffer. Each request
-    gets a (alloc_id, offset) pair based on its actual byte requirement.
-    Freed regions at the tail are reclaimed in FIFO order.
+    gets a (alloc_id, offset, round) triple based on its actual byte
+    requirement. Allocation (assign) is overcommit — it always succeeds
+    as long as the request fits in the buffer. Overlap safety is enforced
+    on the prefill side before RDMA, using a watermark that tracks the
+    oldest un-freed allocation.
 
-    Ring buffer invariant: head never overtakes tail. Allocations that
-    don't fit trigger fallback to the slice transfer path.
+    The watermark (round, tail_offset) is periodically sent to prefill.
+    Prefill transfer workers wait before writing if their target region
+    overlaps with not-yet-freed data from a previous round.
     """
 
     def __init__(
@@ -145,90 +149,80 @@ class StagingAllocator:
         self.buffer = StagingBuffer(total_size_bytes, device, gpu_id, custom_mem_pool)
         self.total_size = total_size_bytes
         self.base_ptr = self.buffer.data_ptr
-        self.head = 0  # next allocation offset
-        self.tail = 0  # oldest live allocation offset
-        self.used = 0  # total bytes currently allocated
-        self.allocations: dict = {}  # alloc_id -> (offset, size)
-        self.alloc_order: List[int] = []  # FIFO order of alloc_ids
+        self.head = 0
+        self.round = 0
+        self.allocations: dict = {}  # alloc_id -> (offset, size, round)
+        self.alloc_order: List[int] = []
         self.next_alloc_id = 0
+        self.watermark_round = 0
+        self.watermark_tail = 0
         self.lock = threading.Lock()
 
         logger.info(
-            f"StagingAllocator (ring): {total_size_bytes / (1024*1024):.1f} MB "
+            f"StagingAllocator (ring+overcommit): "
+            f"{total_size_bytes / (1024*1024):.1f} MB "
             f"on {device}, ptr=0x{self.base_ptr:x}"
         )
 
-    def assign(self, required_bytes: int) -> Optional[Tuple[int, int]]:
-        """Allocate a region from the ring buffer.
+    def assign(self, required_bytes: int) -> Optional[Tuple[int, int, int]]:
+        """Allocate a region. Returns (alloc_id, offset, round) or None.
 
-        Returns (alloc_id, offset) or None if insufficient contiguous space.
+        Overcommit: does not check overlap. Prefill side checks watermark
+        before RDMA to ensure the region is safe to write.
         """
         with self.lock:
             if required_bytes > self.total_size:
                 return None
 
-            free_space = self.total_size - self.used
-            if required_bytes > free_space:
-                return None
-
-            # Try to allocate at head
-            if self.head >= self.tail:
-                # [tail ... head ... end]
-                space_at_end = self.total_size - self.head
-                if required_bytes <= space_at_end:
-                    offset = self.head
-                    self.head += required_bytes
-                elif required_bytes <= self.tail:
-                    # Wrap around: waste the end, allocate at beginning
-                    wasted = space_at_end
-                    self.used += wasted
-                    offset = 0
-                    self.head = required_bytes
-                else:
-                    return None
+            space_at_end = self.total_size - self.head
+            if required_bytes <= space_at_end:
+                offset = self.head
+                self.head += required_bytes
             else:
-                # [... head ... tail ...] (wrapped)
-                space_in_middle = self.tail - self.head
-                if required_bytes <= space_in_middle:
-                    offset = self.head
-                    self.head += required_bytes
-                else:
-                    return None
+                self.round += 1
+                offset = 0
+                self.head = required_bytes
 
-            self.used += required_bytes
             alloc_id = self.next_alloc_id
             self.next_alloc_id += 1
-            self.allocations[alloc_id] = (offset, required_bytes)
+            self.allocations[alloc_id] = (offset, required_bytes, self.round)
             self.alloc_order.append(alloc_id)
-            return (alloc_id, offset)
+            return (alloc_id, offset, self.round)
 
     def free(self, alloc_id: int):
-        """Free an allocation and advance tail past consecutive freed entries."""
+        """Free an allocation and advance watermark past consecutive freed entries."""
         with self.lock:
             if alloc_id not in self.allocations:
                 return
-            _, size = self.allocations.pop(alloc_id)
-            self.used -= size
+            self.allocations.pop(alloc_id)
 
-            # Advance tail past all leading freed entries
             while self.alloc_order and self.alloc_order[0] not in self.allocations:
                 self.alloc_order.pop(0)
 
             if not self.allocations:
-                self.head = 0
-                self.tail = 0
-                self.used = 0
+                self.watermark_round = self.round
+                self.watermark_tail = self.head
             elif self.alloc_order:
-                self.tail = self.allocations[self.alloc_order[0]][0]
+                off, _, rnd = self.allocations[self.alloc_order[0]]
+                self.watermark_round = rnd
+                self.watermark_tail = off
+
+    def get_watermark(self) -> Tuple[int, int]:
+        """Return (round, tail_offset). Everything before this is safe to write."""
+        with self.lock:
+            return (self.watermark_round, self.watermark_tail)
 
     def get_ptr(self, alloc_id: int) -> int:
-        """Return the GPU pointer for a given allocation."""
-        offset, _ = self.allocations[alloc_id]
+        offset, _, _ = self.allocations[alloc_id]
         return self.base_ptr + offset
 
     def get_offset(self, alloc_id: int) -> int:
-        offset, _ = self.allocations[alloc_id]
+        offset, _, _ = self.allocations[alloc_id]
         return offset
+
+    def get_round(self, alloc_id: int) -> int:
+        _, _, rnd = self.allocations[alloc_id]
+        return rnd
 
     def get_base_ptr(self) -> int:
         return self.base_ptr
@@ -401,6 +395,10 @@ def compute_head_slice_params(
     if src_attn_tp_size > dst_attn_tp_size:
         src_head_start = 0
         num_heads_to_send = src_heads_per_rank
+        # TODO(yangminl): GQA fix disabled for A/B test — restore after verification
+        # src_replication = max(1, src_attn_tp_size // total_kv_heads)
+        # unique_head_idx = local_tp_rank // src_replication
+        # dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
         dst_head_start = local_tp_rank * src_heads_per_rank
     else:
         src_head_start = (dst_tp_rank_in_group * dst_heads_per_rank) % src_heads_per_rank
