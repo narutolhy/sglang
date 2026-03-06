@@ -841,15 +841,13 @@ class DecodeTransferQueue:
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
 
-        # Validate bootstrap_room to detect context corruption.
-        # Apply same int64 mask as set_buf() for consistent comparison.
+        # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()
-        raw_room = (
+        expected_room = (
             decode_req.req.bootstrap_room
             if decode_req.req.bootstrap_room is not None
             else 0
         )
-        expected_room = raw_room & 0x7FFFFFFFFFFFFFFF
 
         if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
             pass
