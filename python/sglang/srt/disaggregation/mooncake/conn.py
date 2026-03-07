@@ -70,10 +70,28 @@ class TransferInfo:
     dst_state_indices: List[int]
     required_dst_info_num: int
     is_dummy: bool
-    staging_offset: int = -1  # byte offset into decode staging buffer (-1 = not allocated)
-    staging_alloc_id: int = -1  # allocator ID for freeing
-    staging_round: int = 0  # ring buffer round number
-    staging_end: int = -1  # offset + size (end of allocated region)
+    staging_offsets: List[int] = dataclasses.field(default_factory=lambda: [-1])
+    staging_rounds: List[int] = dataclasses.field(default_factory=lambda: [0])
+    staging_ends: List[int] = dataclasses.field(default_factory=lambda: [-1])
+
+    @property
+    def staging_offset(self) -> int:
+        """Backward compat: first chunk's offset."""
+        return self.staging_offsets[0] if self.staging_offsets else -1
+
+    @property
+    def staging_round(self) -> int:
+        return self.staging_rounds[0] if self.staging_rounds else 0
+
+    @property
+    def staging_end(self) -> int:
+        return self.staging_ends[0] if self.staging_ends else -1
+
+    @classmethod
+    def _parse_csv_ints(cls, raw: str, default: int) -> List[int]:
+        if not raw or raw == "":
+            return [default]
+        return [int(x) for x in raw.split(",")]
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -90,21 +108,9 @@ class TransferInfo:
             else:
                 dst_state_indices = list(np.frombuffer(msg[6], dtype=np.int32))
             is_dummy = False
-        staging_offset = (
-            int(msg[8].decode("ascii"))
-            if len(msg) > 8 and msg[8] != b""
-            else -1
-        )
-        staging_round = (
-            int(msg[9].decode("ascii"))
-            if len(msg) > 9 and msg[9] != b""
-            else 0
-        )
-        staging_end = (
-            int(msg[10].decode("ascii"))
-            if len(msg) > 10 and msg[10] != b""
-            else -1
-        )
+        offsets_raw = msg[8].decode("ascii") if len(msg) > 8 and msg[8] != b"" else ""
+        rounds_raw = msg[9].decode("ascii") if len(msg) > 9 and msg[9] != b"" else ""
+        ends_raw = msg[10].decode("ascii") if len(msg) > 10 and msg[10] != b"" else ""
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -115,9 +121,9 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
-            staging_offset=staging_offset,
-            staging_round=staging_round,
-            staging_end=staging_end,
+            staging_offsets=cls._parse_csv_ints(offsets_raw, -1),
+            staging_rounds=cls._parse_csv_ints(rounds_raw, 0),
+            staging_ends=cls._parse_csv_ints(ends_raw, -1),
         )
 
 
@@ -259,6 +265,7 @@ class MooncakeKVManager(CommonKVManager):
             self.start_decode_thread()
             self.staging_buffers = []
             self.staging_allocator = None
+            self.pending_chunk_scatters = {}  # room → [(chunk_idx, page_start, num_pages, session_id)]
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
             if self.enable_staging:
                 self._init_staging_allocator()
@@ -380,8 +387,6 @@ class MooncakeKVManager(CommonKVManager):
         per_layer_bytes = num_tokens * num_heads_to_send * head_dim * dtype_size
         per_rank_bytes = per_layer_bytes * num_layers * 2
 
-        # When multiple prefill ranks write to 1 decode rank, each rank
-        # must write to a different offset to avoid overwriting each other.
         if self.attn_tp_size > dst_attn_tp_size:
             num_writers = self.attn_tp_size // max(1, dst_attn_tp_size)
             rank_offset = local_tp_rank * per_rank_bytes
@@ -1045,35 +1050,33 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                             )
                         elif use_staging:
-                            # Wait until the target region from the PREVIOUS
-                            # round has been freed (scatter completed on decode).
-                            # watermark = (wm_round, wm_tail) means: everything
-                            # in rounds < wm_round is freed, and in wm_round
-                            # everything with offset < wm_tail is freed.
-                            #
-                            # This req at (req_round, req_offset) overwrites the
-                            # same physical region used by (req_round-1, req_offset).
-                            # Safe to write iff that previous-round region is freed.
-                            req_round = req.staging_round
-                            req_end = req.staging_end
-                            while req_round > 0:
+                            page_size = self.kv_buffer_tensors["page_size"]
+                            chunk_pages = len(kv_chunk.prefill_kv_indices)
+                            chunk_idx = kv_chunk.index_slice.start // chunk_pages if chunk_pages > 0 else 0
+                            if chunk_idx >= len(req.staging_offsets):
+                                chunk_idx = len(req.staging_offsets) - 1
+
+                            c_offset = req.staging_offsets[chunk_idx]
+                            c_round = req.staging_rounds[chunk_idx]
+                            c_end = req.staging_ends[chunk_idx]
+
+                            while c_round > 0:
                                 wm_round, wm_tail = self.remote_watermarks.get(
                                     req.mooncake_session_id, (0, 0)
                                 )
-                                prev_round = req_round - 1
-                                if prev_round < wm_round:
-                                    break  # Entire prev round freed
-                                if prev_round == wm_round and req_end <= wm_tail:
-                                    break  # Prev round, region fully freed
+                                if c_round - 1 < wm_round:
+                                    break
+                                if c_round - 1 == wm_round and c_end <= wm_tail:
+                                    break
                                 time.sleep(0.001)
 
                             dst_staging_ptr = (
                                 target_rank_registration_info.dst_staging_base_ptr
-                                + req.staging_offset
+                                + c_offset
                             )
                             dst_staging_size = (
                                 target_rank_registration_info.dst_staging_total_size
-                                - req.staging_offset
+                                - c_offset
                             )
                             try:
                                 ret = self.send_kvcache_staged(
@@ -1139,6 +1142,23 @@ class MooncakeKVManager(CommonKVManager):
                                 local_rank,
                             )
                             break
+
+                        if use_staging and not kv_chunk.is_last and ret == 0:
+                            try:
+                                self._connect(
+                                    format_tcp_address(req.endpoint, req.dst_port),
+                                    is_ipv6=is_valid_ipv6_address(req.endpoint),
+                                ).send_multipart([
+                                    b"CHUNK_READY",
+                                    str(req.room).encode("ascii"),
+                                    str(chunk_idx).encode("ascii"),
+                                    str(kv_chunk.index_slice.start).encode("ascii"),
+                                    str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+                                    req.mooncake_session_id.encode("ascii"),
+                                    str(local_rank).encode("ascii"),
+                                ])
+                            except Exception:
+                                pass
 
                         if kv_chunk.is_last:
                             if kv_chunk.state_indices is not None:
@@ -1240,6 +1260,19 @@ class MooncakeKVManager(CommonKVManager):
                 msg = self.server_socket.recv_multipart()
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
+                    continue
+
+                if msg[0] == b"CHUNK_READY":
+                    room = int(msg[1].decode("ascii"))
+                    chunk_idx = int(msg[2].decode("ascii"))
+                    page_start = int(msg[3].decode("ascii"))
+                    num_pages = int(msg[4].decode("ascii"))
+                    session_id = msg[5].decode("ascii")
+                    if room not in self.pending_chunk_scatters:
+                        self.pending_chunk_scatters[room] = []
+                    self.pending_chunk_scatters[room].append(
+                        (chunk_idx, page_start, num_pages, session_id)
+                    )
                     continue
 
                 bootstrap_room, status, prefill_rank = msg
@@ -1585,43 +1618,53 @@ class MooncakeKVReceiver(CommonKVReceiver):
             return
 
         staging_allocator = getattr(self.kv_mgr, "staging_allocator", None)
-        self.staging_offset = -1
-        self.staging_alloc_id = -1
-        self.staging_round = 0
-        self.staging_end = -1
+        self.chunk_staging_infos = []  # [(alloc_id, offset, round, end), ...]
         if staging_allocator is not None:
-            # Compute required staging bytes from kv_item_lens (always available).
-            # kv_item_lens = [k_layer0_item, ..., k_layerN_item, v_layer0_item, ..., v_layerN_item]
-            # Each item = page_size * heads_per_rank * head_dim * dtype_size
             page_size = self.kv_mgr.kv_args.page_size
             num_pages = len(kv_indices)
-            num_tokens = num_pages * page_size
             kv_item_lens = self.kv_mgr.kv_args.kv_item_lens
             num_kv_layers = len(kv_item_lens) // 2
-            # Decode-side bytes per page for K (or V)
             decode_bytes_per_page = kv_item_lens[0]
-            # Decode heads_per_rank * head_dim * dtype_size = bytes_per_page / page_size
             decode_head_bytes_per_token = decode_bytes_per_page // page_size
             attn_tp_size = self.kv_mgr.attn_tp_size
             prefill_attn_tp = getattr(self.kv_mgr, "prefill_attn_tp_size", attn_tp_size)
             if prefill_attn_tp > attn_tp_size:
                 num_writers = prefill_attn_tp // max(1, attn_tp_size)
-                # Each prefill rank sends (decode_heads / num_writers) heads
                 src_head_bytes_per_token = decode_head_bytes_per_token // num_writers
             else:
                 num_writers = 1
                 src_head_bytes_per_token = decode_head_bytes_per_token
-            per_rank_bytes = num_tokens * src_head_bytes_per_token * num_kv_layers * 2
-            required_bytes = num_writers * per_rank_bytes
 
-            result = staging_allocator.assign(required_bytes)
-            if result is not None:
-                self.staging_alloc_id, self.staging_offset, self.staging_round = result
-                self.staging_end = self.staging_offset + required_bytes
-            else:
-                logger.warning_once(
-                    f"[Staging] allocator returned None: need {required_bytes} bytes"
-                )
+            chunked_prefill_size = self.kv_mgr.server_args.chunked_prefill_size or 8192
+            chunk_pages = max(1, chunked_prefill_size // page_size)
+            remaining = num_pages
+            while remaining > 0:
+                cp = min(remaining, chunk_pages)
+                chunk_tokens = cp * page_size
+                per_rank = chunk_tokens * src_head_bytes_per_token * num_kv_layers * 2
+                required = num_writers * per_rank
+                result = staging_allocator.assign(required)
+                if result is not None:
+                    alloc_id, offset, rnd = result
+                    self.chunk_staging_infos.append(
+                        (alloc_id, offset, rnd, offset + required)
+                    )
+                else:
+                    logger.warning_once(
+                        f"[Staging] allocator returned None for chunk: need {required} bytes"
+                    )
+                    self.chunk_staging_infos.append((-1, -1, 0, -1))
+                remaining -= cp
+
+        offsets_str = ",".join(
+            str(info[1]) for info in self.chunk_staging_infos
+        ) if self.chunk_staging_infos else "-1"
+        rounds_str = ",".join(
+            str(info[2]) for info in self.chunk_staging_infos
+        ) if self.chunk_staging_infos else "0"
+        ends_str = ",".join(
+            str(info[3]) for info in self.chunk_staging_infos
+        ) if self.chunk_staging_infos else "-1"
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -1645,9 +1688,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             else b""
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
-                        str(self.staging_offset).encode("ascii"),
-                        str(self.staging_round).encode("ascii"),
-                        str(self.staging_end).encode("ascii"),
+                        offsets_str.encode("ascii"),
+                        rounds_str.encode("ascii"),
+                        ends_str.encode("ascii"),
                     ]
                 )
         self.init_time = time.time()

@@ -902,35 +902,27 @@ class DecodeTransferQueue:
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return True
 
-    def _submit_scatter_staging(self, decode_req: DecodeRequest) -> int:
-        """Submit scatter kernels to scatter_stream without synchronizing.
+    def _scatter_staging_region(
+        self,
+        staging_offset: int,
+        page_start: int,
+        num_pages: int,
+        decode_req: DecodeRequest,
+    ) -> bool:
+        """Submit scatter kernels for a staging region to scatter_stream.
 
-        Returns the alloc_id (>= 0) if scatter was submitted,
-        or -1 if no scatter is needed for this request.
-        The caller tracks completion via CUDA events.
+        Works for both per-chunk and full-request scatter.
+        Returns True if scatter was submitted, False otherwise.
         """
-        from sglang.srt.environ import envs
-
-        if not envs.SGLANG_DISAGG_STAGING_BUFFER.get():
-            return -1
-
         kv_manager = getattr(self.scheduler, "_decode_kv_manager", None)
         if kv_manager is None:
-            return -1
+            return False
         staging_allocator = getattr(kv_manager, "staging_allocator", None)
         if staging_allocator is None:
-            return -1
-
-        receiver = decode_req.kv_receiver
-        staging_offset = getattr(receiver, "staging_offset", -1)
-        alloc_id = getattr(receiver, "staging_alloc_id", -1)
-        if staging_offset < 0 or alloc_id < 0:
-            return -1
-
+            return False
         kv_buffer_info = getattr(kv_manager, "kv_buffer_tensors", None)
         if kv_buffer_info is None:
-            staging_allocator.free(alloc_id)
-            return -1
+            return False
 
         from sglang.srt.disaggregation.common.staging import (
             compute_head_slice_params,
@@ -940,7 +932,7 @@ class DecodeTransferQueue:
         prefill_attn_tp_size = getattr(kv_manager, "prefill_attn_tp_size", 0)
         decode_attn_tp_size = kv_manager.attn_tp_size
         if prefill_attn_tp_size == 0 or prefill_attn_tp_size == decode_attn_tp_size:
-            return -1
+            return False
 
         k_buffers = kv_buffer_info["k_buffers"]
         v_buffers = kv_buffer_info["v_buffers"]
@@ -956,11 +948,11 @@ class DecodeTransferQueue:
 
         dst_tp_rank = kv_manager.kv_args.engine_rank % decode_attn_tp_size
 
-        req = decode_req.req
-        seq_len = len(req.origin_input_ids)
-        req_pool_idx = req.req_pool_idx
+        req_pool_idx = decode_req.req.req_pool_idx
+        token_start = page_start * page_size
+        token_end = token_start + num_pages * page_size
         kv_indices = self.scheduler.req_to_token_pool.req_to_token[
-            req_pool_idx, :seq_len
+            req_pool_idx, token_start:token_end
         ]
         if page_size > 1:
             from sglang.srt.disaggregation.utils import kv_to_page_indices
@@ -976,19 +968,11 @@ class DecodeTransferQueue:
         else:
             num_writers = 1
 
-        staging_view = staging_allocator.buffer.buffer
-        # Offset into the staging buffer for this request
-        req_offset = staging_offset
-        staging_view = staging_view[req_offset:]
+        staging_view = staging_allocator.buffer.buffer[staging_offset:]
 
         if not hasattr(staging_allocator, "_scatter_stream"):
             staging_allocator._scatter_stream = torch.cuda.Stream()
 
-        # RDMA ordering barrier: per NVIDIA GPUDirect RDMA §2.7, GPU kernels
-        # may observe stale data from third-party DMA writes until a CPU-initiated
-        # CUDA memory operation establishes ordering. A single .item() (which does
-        # cudaMemcpyDeviceToHost internally) satisfies this requirement for ALL
-        # prior DMA writes, replacing the heavy torch.cuda.synchronize().
         staging_view[0].item()
 
         with torch.cuda.stream(staging_allocator._scatter_stream):
@@ -1021,38 +1005,146 @@ class DecodeTransferQueue:
                         page_idx_tensor, dst_head_start, num_heads, page_size,
                     )
                     offset += per_layer_bytes
+        return True
 
-        return alloc_id
+    def _submit_scatter_staging(self, decode_req: DecodeRequest) -> int:
+        """Submit scatter for the last chunk (triggered by KVPoll.Success).
 
-    def _complete_async_scatter(self, decode_req: DecodeRequest) -> None:
-        """Free staging allocation and ensure memory visibility for a completed scatter."""
+        Returns the alloc_id (>= 0) if scatter was submitted, or -1.
+        """
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+            return -1
+
+        receiver = decode_req.kv_receiver
+        chunk_infos = getattr(receiver, "chunk_staging_infos", [])
+        if not chunk_infos:
+            return -1
+
+        last_info = chunk_infos[-1]
+        alloc_id, staging_offset, _, _ = last_info
+        if staging_offset < 0 or alloc_id < 0:
+            return -1
+
+        seq_len = len(decode_req.req.origin_input_ids)
+        allocator = getattr(self.scheduler, "token_to_kv_pool_allocator", None)
+        ps = allocator.page_size if allocator else 1
+        total_pages = (seq_len + ps - 1) // ps
+
+        n = len(chunk_infos)
+        page_start = total_pages - (total_pages // n + (1 if (n - 1) < total_pages % n else 0))
+        last_num_pages = total_pages - page_start
+
+        ok = self._scatter_staging_region(
+            staging_offset, page_start, last_num_pages, decode_req
+        )
+        return alloc_id if ok else -1
+
+    def _free_and_send_watermark(self, alloc_id: int, decode_req: DecodeRequest):
+        """Free a staging allocation and send watermark to prefill."""
         kv_manager = getattr(self.scheduler, "_decode_kv_manager", None)
         staging_allocator = getattr(kv_manager, "staging_allocator", None) if kv_manager else None
-        if staging_allocator is not None:
-            kv_buffer_info = getattr(kv_manager, "kv_buffer_tensors", None)
-            if kv_buffer_info is not None:
-                device = kv_buffer_info["k_buffers"][0].device
-                torch.cuda.default_stream(device).wait_event(decode_req._scatter_event)
-            staging_allocator.free(decode_req._scatter_alloc_id)
-            # Send watermark update to prefill via the receiver's bootstrap connection
-            receiver = decode_req.kv_receiver
-            if receiver is not None and hasattr(receiver, "bootstrap_infos") and receiver.bootstrap_infos:
-                wm_round, wm_tail = staging_allocator.get_watermark()
-                for bootstrap_info in receiver.bootstrap_infos:
-                    try:
-                        sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
-                        with lock:
-                            sock.send_multipart([
-                                b"WATERMARK",
-                                str(wm_round).encode("ascii"),
-                                str(wm_tail).encode("ascii"),
-                            ])
-                    except Exception:
-                        pass  # Best-effort; prefill will eventually see the update
+        if staging_allocator is None:
+            return
+        staging_allocator.free(alloc_id)
+        receiver = decode_req.kv_receiver
+        if receiver is not None and hasattr(receiver, "bootstrap_infos") and receiver.bootstrap_infos:
+            wm_round, wm_tail = staging_allocator.get_watermark()
+            session_id = getattr(receiver, "session_id", "")
+            for bootstrap_info in receiver.bootstrap_infos:
+                try:
+                    sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
+                    with lock:
+                        sock.send_multipart([
+                            b"WATERMARK",
+                            str(wm_round).encode("ascii"),
+                            str(wm_tail).encode("ascii"),
+                            session_id.encode("ascii"),
+                        ])
+                except Exception:
+                    pass
+
+    def _complete_async_scatter(self, decode_req: DecodeRequest) -> None:
+        """Wait for scatter event, then free staging and send watermark."""
+        kv_manager = getattr(self.scheduler, "_decode_kv_manager", None)
+        kv_buffer_info = getattr(kv_manager, "kv_buffer_tensors", None) if kv_manager else None
+        if kv_buffer_info is not None:
+            device = kv_buffer_info["k_buffers"][0].device
+            torch.cuda.default_stream(device).wait_event(decode_req._scatter_event)
+        self._free_and_send_watermark(decode_req._scatter_alloc_id, decode_req)
         decode_req._scatter_event = None
         decode_req._scatter_alloc_id = -1
 
+    def _process_pending_chunk_scatters(self):
+        """Submit async scatter for CHUNK_READY tasks, tracked via per-req event lists."""
+        kv_manager = getattr(self.scheduler, "_decode_kv_manager", None)
+        if kv_manager is None:
+            return
+        pending = getattr(kv_manager, "pending_chunk_scatters", {})
+        if not pending:
+            return
+        staging_allocator = getattr(kv_manager, "staging_allocator", None)
+        if staging_allocator is None:
+            return
+
+        room_to_req = {
+            dr.req.bootstrap_room: dr for dr in self.queue
+            if dr.req.bootstrap_room in pending
+        }
+
+        processed_rooms = []
+        for room, chunks in pending.items():
+            decode_req = room_to_req.get(room)
+            if decode_req is None:
+                continue
+            chunk_infos = getattr(decode_req.kv_receiver, "chunk_staging_infos", [])
+            if not chunk_infos:
+                continue
+
+            if not hasattr(decode_req, "_chunk_events"):
+                decode_req._chunk_events = []
+
+            for chunk_idx, page_start, num_pages, _ in chunks:
+                if chunk_idx >= len(chunk_infos):
+                    continue
+                alloc_id, staging_offset, _, _ = chunk_infos[chunk_idx]
+                if staging_offset < 0:
+                    continue
+                ok = self._scatter_staging_region(
+                    staging_offset, page_start, num_pages, decode_req
+                )
+                if ok:
+                    scatter_stream = getattr(staging_allocator, "_scatter_stream", None)
+                    event = torch.cuda.Event()
+                    if scatter_stream is not None:
+                        event.record(scatter_stream)
+                    decode_req._chunk_events.append((event, alloc_id))
+                    chunk_infos[chunk_idx] = (-1, -1, 0, -1)
+            processed_rooms.append(room)
+
+        for room in processed_rooms:
+            pending.pop(room, None)
+
+        for decode_req in self.queue:
+            chunk_events = getattr(decode_req, "_chunk_events", None)
+            if not chunk_events:
+                continue
+            remaining = []
+            for event, alloc_id in chunk_events:
+                if event.query():
+                    kv_buffer_info = getattr(kv_manager, "kv_buffer_tensors", None)
+                    if kv_buffer_info is not None:
+                        device = kv_buffer_info["k_buffers"][0].device
+                        torch.cuda.default_stream(device).wait_event(event)
+                    self._free_and_send_watermark(alloc_id, decode_req)
+                else:
+                    remaining.append((event, alloc_id))
+            decode_req._chunk_events = remaining
+
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+        self._process_pending_chunk_scatters()
+
         if not self.queue:
             return []
         polls = poll_and_all_reduce(
@@ -1065,7 +1157,6 @@ class DecodeTransferQueue:
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
-            # Check if this request has a pending async scatter from a previous iteration.
             pending_event = getattr(decode_req, "_scatter_event", None)
             if pending_event is not None:
                 if not pending_event.query():
