@@ -286,6 +286,13 @@ class DecodePreallocQueue:
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.prefill_pp_size = self.prefill_pp_size
+        kv_pool_for_heads = self.token_to_kv_pool
+        if hasattr(kv_pool_for_heads, "full_kv_pool"):
+            kv_pool_for_heads = kv_pool_for_heads.full_kv_pool
+        per_rank_kv_heads = getattr(kv_pool_for_heads, "head_num", 0)
+        if per_rank_kv_heads > 0:
+            kv_args.kv_head_num = per_rank_kv_heads
+            kv_args.total_kv_head_num = per_rank_kv_heads * attn_tp_size
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )

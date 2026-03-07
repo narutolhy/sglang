@@ -375,7 +375,13 @@ class MooncakeKVManager(CommonKVManager):
 
         total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
         if total_kv_heads <= 0:
-            total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
+            kv_head_num = getattr(self.kv_args, "kv_head_num", 0)
+            if kv_head_num > 0:
+                total_kv_heads = kv_head_num * self.attn_tp_size
+            else:
+                # Fallback for runtimes that don't populate kv_head_num.
+                # For current decode TP rank, at least one KV head must exist.
+                total_kv_heads = max(1, dst_attn_tp_size)
 
         local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
         src_head_start, num_heads_to_send, _, _ = compute_head_slice_params(
@@ -389,8 +395,21 @@ class MooncakeKVManager(CommonKVManager):
 
         if self.attn_tp_size > dst_attn_tp_size:
             num_writers = self.attn_tp_size // max(1, dst_attn_tp_size)
-            rank_offset = local_tp_rank * per_rank_bytes
-            total_staging_needed = num_writers * per_rank_bytes
+            writer_rank_bytes = []
+            for writer_rank in range(num_writers):
+                _, writer_num_heads, _, _ = compute_head_slice_params(
+                    self.attn_tp_size,
+                    dst_attn_tp_size,
+                    writer_rank,
+                    dst_tp_rank,
+                    total_kv_heads,
+                )
+                writer_layer_bytes = (
+                    num_tokens * writer_num_heads * head_dim * dtype_size
+                )
+                writer_rank_bytes.append(writer_layer_bytes * num_layers * 2)
+            rank_offset = sum(writer_rank_bytes[:local_tp_rank])
+            total_staging_needed = sum(writer_rank_bytes)
         else:
             rank_offset = 0
             total_staging_needed = per_rank_bytes
@@ -594,7 +613,11 @@ class MooncakeKVManager(CommonKVManager):
         # Per-rank kv_head_num is max(1, total//tp) which loses info when total < tp.
         total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
         if total_kv_heads <= 0:
-            total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
+            kv_head_num = getattr(self.kv_args, "kv_head_num", 0)
+            if kv_head_num > 0:
+                total_kv_heads = kv_head_num * self.attn_tp_size
+            else:
+                total_kv_heads = max(1, dst_attn_tp_size)
 
         src_heads_per_rank = max(1, total_kv_heads // self.attn_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
@@ -1620,20 +1643,43 @@ class MooncakeKVReceiver(CommonKVReceiver):
         staging_allocator = getattr(self.kv_mgr, "staging_allocator", None)
         self.chunk_staging_infos = []  # [(alloc_id, offset, round, end), ...]
         if staging_allocator is not None:
+            from sglang.srt.disaggregation.common.staging import (
+                compute_head_slice_params,
+            )
+
             page_size = self.kv_mgr.kv_args.page_size
             num_pages = len(kv_indices)
             kv_item_lens = self.kv_mgr.kv_args.kv_item_lens
             num_kv_layers = len(kv_item_lens) // 2
             decode_bytes_per_page = kv_item_lens[0]
-            decode_head_bytes_per_token = decode_bytes_per_page // page_size
+            decode_bytes_per_token = decode_bytes_per_page // page_size
             attn_tp_size = self.kv_mgr.attn_tp_size
             prefill_attn_tp = getattr(self.kv_mgr, "prefill_attn_tp_size", attn_tp_size)
-            if prefill_attn_tp > attn_tp_size:
-                num_writers = prefill_attn_tp // max(1, attn_tp_size)
-                src_head_bytes_per_token = decode_head_bytes_per_token // num_writers
-            else:
-                num_writers = 1
-                src_head_bytes_per_token = decode_head_bytes_per_token
+            total_kv_heads = getattr(self.kv_mgr.kv_args, "total_kv_head_num", 0)
+            if total_kv_heads <= 0:
+                kv_head_num = getattr(self.kv_mgr.kv_args, "kv_head_num", 0)
+                if kv_head_num > 0:
+                    total_kv_heads = kv_head_num * attn_tp_size
+                else:
+                    kv_buffer_info = getattr(self.kv_mgr, "kv_buffer_tensors", None)
+                    if (
+                        kv_buffer_info is not None
+                        and kv_buffer_info.get("k_buffers")
+                        and len(kv_buffer_info["k_buffers"]) > 0
+                    ):
+                        decode_heads_per_rank = int(kv_buffer_info["k_buffers"][0].shape[1])
+                        total_kv_heads = decode_heads_per_rank * max(1, attn_tp_size)
+                    else:
+                        # Keep runtime alive without introducing large over-estimation.
+                        total_kv_heads = max(1, attn_tp_size)
+            dst_heads_per_rank = max(1, total_kv_heads // max(1, attn_tp_size))
+            bytes_per_head_per_token = decode_bytes_per_token // dst_heads_per_rank
+            dst_tp_rank = self.kv_mgr.kv_args.engine_rank % max(1, attn_tp_size)
+            num_writers = (
+                prefill_attn_tp // max(1, attn_tp_size)
+                if prefill_attn_tp > attn_tp_size
+                else 1
+            )
 
             chunked_prefill_size = self.kv_mgr.server_args.chunked_prefill_size or 8192
             chunk_pages = max(1, chunked_prefill_size // page_size)
@@ -1641,8 +1687,23 @@ class MooncakeKVReceiver(CommonKVReceiver):
             while remaining > 0:
                 cp = min(remaining, chunk_pages)
                 chunk_tokens = cp * page_size
-                per_rank = chunk_tokens * src_head_bytes_per_token * num_kv_layers * 2
-                required = num_writers * per_rank
+                required = 0
+                for writer_rank in range(num_writers):
+                    _, writer_num_heads, _, _ = compute_head_slice_params(
+                        prefill_attn_tp,
+                        attn_tp_size,
+                        writer_rank,
+                        dst_tp_rank,
+                        total_kv_heads,
+                    )
+                    writer_rank_bytes = (
+                        chunk_tokens
+                        * writer_num_heads
+                        * bytes_per_head_per_token
+                        * num_kv_layers
+                        * 2
+                    )
+                    required += writer_rank_bytes
                 result = staging_allocator.assign(required)
                 if result is not None:
                     alloc_id, offset, rnd = result
