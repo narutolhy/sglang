@@ -395,11 +395,9 @@ def compute_head_slice_params(
     if src_attn_tp_size > dst_attn_tp_size:
         src_head_start = 0
         num_heads_to_send = src_heads_per_rank
-        # TODO(yangminl): GQA fix disabled for A/B test — restore after verification
-        # src_replication = max(1, src_attn_tp_size // total_kv_heads)
-        # unique_head_idx = local_tp_rank // src_replication
-        # dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
-        dst_head_start = local_tp_rank * src_heads_per_rank
+        src_replication = max(1, src_attn_tp_size // total_kv_heads)
+        unique_head_idx = local_tp_rank // src_replication
+        dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
     else:
         src_head_start = (dst_tp_rank_in_group * dst_heads_per_rank) % src_heads_per_rank
         num_heads_to_send = dst_heads_per_rank
