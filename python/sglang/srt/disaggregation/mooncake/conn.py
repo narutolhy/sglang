@@ -215,7 +215,7 @@ class MooncakeKVManager(CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
-            self.remote_watermark = (0, 0)  # (round, tail_offset) from decode
+            self.remote_watermarks = {}  # session_id → (round, tail_offset) per decode rank
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -1057,7 +1057,9 @@ class MooncakeKVManager(CommonKVManager):
                             req_round = req.staging_round
                             req_end = req.staging_end
                             while req_round > 0:
-                                wm_round, wm_tail = self.remote_watermark
+                                wm_round, wm_tail = self.remote_watermarks.get(
+                                    req.mooncake_session_id, (0, 0)
+                                )
                                 prev_round = req_round - 1
                                 if prev_round < wm_round:
                                     break  # Entire prev round freed
@@ -1193,13 +1195,18 @@ class MooncakeKVManager(CommonKVManager):
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
                 room = waiting_req_bytes[0].decode("ascii")
-                mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "WATERMARK":
                     wm_round = int(waiting_req_bytes[1].decode("ascii"))
                     wm_tail = int(waiting_req_bytes[2].decode("ascii"))
-                    self.remote_watermark = (wm_round, wm_tail)
+                    wm_session = (
+                        waiting_req_bytes[3].decode("ascii")
+                        if len(waiting_req_bytes) > 3
+                        else ""
+                    )
+                    self.remote_watermarks[wm_session] = (wm_round, wm_tail)
                     continue
-                elif room == "None":
+                mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+                if room == "None":
                     self.decode_kv_args_table[mooncake_session_id] = (
                         KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     )
