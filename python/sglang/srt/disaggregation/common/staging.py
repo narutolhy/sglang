@@ -374,6 +374,63 @@ def gather_all_layers_to_staging(
     return offset
 
 
+def scatter_staging_to_kv(
+    staging_buffer_view: torch.Tensor,
+    k_buffers: list,
+    v_buffers: list,
+    page_idx_tensor: torch.Tensor,
+    page_size: int,
+    prefill_attn_tp_size: int,
+    decode_attn_tp_size: int,
+    dst_tp_rank: int,
+    total_kv_heads: int,
+) -> None:
+    """Scatter data from a contiguous staging region into KV cache buffers.
+
+    This is backend-agnostic: it only performs GPU scatter operations.
+    The caller is responsible for resolving page indices, ensuring
+    the staging data is visible on GPU, and selecting the CUDA stream.
+    """
+    num_layers = len(k_buffers)
+    head_dim = k_buffers[0].shape[-1]
+    dtype_size = k_buffers[0].element_size()
+    num_tokens = page_idx_tensor.shape[0] * page_size
+
+    if prefill_attn_tp_size > decode_attn_tp_size:
+        num_writers = prefill_attn_tp_size // max(1, decode_attn_tp_size)
+    else:
+        num_writers = 1
+
+    for writer_rank in range(num_writers):
+        _, num_heads, dst_head_start, _ = compute_head_slice_params(
+            prefill_attn_tp_size, decode_attn_tp_size,
+            writer_rank, dst_tp_rank, total_kv_heads,
+        )
+        per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
+        per_rank_bytes = per_layer_bytes * num_layers * 2
+        rank_base = writer_rank * per_rank_bytes
+
+        offset = rank_base
+        for layer_id in range(num_layers):
+            layer_data = staging_buffer_view[offset:offset + per_layer_bytes].view(
+                k_buffers[layer_id].dtype
+            ).reshape(num_tokens, num_heads, head_dim)
+            scatter_kv_head_slices(
+                layer_data, k_buffers[layer_id],
+                page_idx_tensor, dst_head_start, num_heads, page_size,
+            )
+            offset += per_layer_bytes
+        for layer_id in range(num_layers):
+            layer_data = staging_buffer_view[offset:offset + per_layer_bytes].view(
+                v_buffers[layer_id].dtype
+            ).reshape(num_tokens, num_heads, head_dim)
+            scatter_kv_head_slices(
+                layer_data, v_buffers[layer_id],
+                page_idx_tensor, dst_head_start, num_heads, page_size,
+            )
+            offset += per_layer_bytes
+
+
 def compute_head_slice_params(
     src_attn_tp_size: int,
     dst_attn_tp_size: int,
@@ -404,3 +461,101 @@ def compute_head_slice_params(
         dst_head_start = 0
 
     return src_head_start, num_heads_to_send, dst_head_start, num_heads_to_send
+
+
+def compute_staging_layout(
+    src_attn_tp_size: int,
+    dst_attn_tp_size: int,
+    dst_tp_rank: int,
+    total_kv_heads: int,
+    num_tokens: int,
+    bytes_per_head_token: int,
+    num_layers: int,
+) -> Tuple[int, List[int], int]:
+    """Compute per-writer byte layout for a staging region.
+
+    Returns:
+        (num_writers, writer_bytes_list, total_bytes)
+        where writer_bytes_list[i] = bytes for writer i covering all layers (K+V).
+    """
+    if src_attn_tp_size > dst_attn_tp_size:
+        num_writers = src_attn_tp_size // max(1, dst_attn_tp_size)
+    else:
+        num_writers = 1
+
+    writer_bytes = []
+    for wr in range(num_writers):
+        _, nh, _, _ = compute_head_slice_params(
+            src_attn_tp_size, dst_attn_tp_size, wr, dst_tp_rank, total_kv_heads,
+        )
+        writer_bytes.append(num_tokens * nh * bytes_per_head_token * num_layers * 2)
+    return num_writers, writer_bytes, sum(writer_bytes)
+
+
+def allocate_chunk_staging(
+    allocator,
+    num_pages: int,
+    page_size: int,
+    chunk_pages: int,
+    prefill_attn_tp: int,
+    decode_attn_tp: int,
+    dst_tp_rank: int,
+    total_kv_heads: int,
+    bytes_per_head_per_token: int,
+    num_kv_layers: int,
+) -> List[Tuple[int, int, int, int]]:
+    """Allocate per-chunk staging regions from a StagingAllocator.
+
+    Splits total_pages into chunks of chunk_pages, computes the required staging
+    bytes per chunk via compute_staging_layout, and assigns from the allocator.
+
+    Returns list of (alloc_id, offset, round, end) per chunk.
+    Failed allocations are recorded as (-1, -1, 0, -1).
+    """
+    infos: List[Tuple[int, int, int, int]] = []
+    remaining = num_pages
+    while remaining > 0:
+        cp = min(remaining, chunk_pages)
+        chunk_tokens = cp * page_size
+        _, _, required = compute_staging_layout(
+            prefill_attn_tp, decode_attn_tp, dst_tp_rank, total_kv_heads,
+            chunk_tokens, bytes_per_head_per_token, num_kv_layers,
+        )
+        result = allocator.assign(required)
+        if result is not None:
+            alloc_id, offset, rnd = result
+            infos.append((alloc_id, offset, rnd, offset + required))
+        else:
+            logger.warning_once(
+                f"[Staging] allocator returned None for chunk: need {required} bytes"
+            )
+            infos.append((-1, -1, 0, -1))
+        remaining -= cp
+    return infos
+
+
+def resolve_total_kv_heads(
+    kv_args,
+    attn_tp_size: int,
+    kv_buffer_tensors=None,
+) -> int:
+    """Resolve the global total KV head count from available metadata.
+
+    Tries in order: kv_args.total_kv_head_num, kv_args.kv_head_num * attn_tp_size,
+    kv_buffer_tensors shape.  Raises if none are available.
+    """
+    total = getattr(kv_args, "total_kv_head_num", 0)
+    if total > 0:
+        return total
+    per_rank = getattr(kv_args, "kv_head_num", 0)
+    if per_rank > 0:
+        return per_rank * attn_tp_size
+    if kv_buffer_tensors is not None:
+        k_bufs = kv_buffer_tensors.get("k_buffers") if isinstance(kv_buffer_tensors, dict) else None
+        if k_bufs and len(k_bufs) > 0:
+            return int(k_bufs[0].shape[1]) * max(1, attn_tp_size)
+    raise ValueError(
+        "Cannot resolve total_kv_heads: kv_args has neither total_kv_head_num "
+        "nor kv_head_num, and no kv_buffer_tensors provided. "
+        "Ensure DecodePreallocQueue._init_kv_manager sets kv_args.kv_head_num."
+    )
