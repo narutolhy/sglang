@@ -43,9 +43,7 @@ class StagingBuffer:
         torch.cuda.set_device(gpu_id)
         if custom_mem_pool is not None:
             with torch.cuda.use_mem_pool(custom_mem_pool):
-                self.buffer = torch.empty(
-                    size_bytes, dtype=torch.uint8, device=device
-                )
+                self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
             alloc_method = "custom_mem_pool (cuMemCreate)"
         else:
             self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
@@ -269,12 +267,16 @@ def gather_kv_head_slices(
         page_size: Number of tokens per page.
     """
     if page_size == 1:
-        selected = kv_buffer_tensor[page_indices, head_start:head_start + num_heads, :]
+        selected = kv_buffer_tensor[
+            page_indices, head_start : head_start + num_heads, :
+        ]
         staging_tensor.copy_(selected.reshape(staging_tensor.shape))
     else:
         offsets = torch.arange(page_size, device=page_indices.device)
         token_indices = (page_indices.unsqueeze(1) * page_size + offsets).reshape(-1)
-        selected = kv_buffer_tensor[token_indices, head_start:head_start + num_heads, :]
+        selected = kv_buffer_tensor[
+            token_indices, head_start : head_start + num_heads, :
+        ]
         staging_tensor.copy_(selected.reshape(staging_tensor.shape))
 
 
@@ -300,13 +302,13 @@ def scatter_kv_head_slices(
     if page_size == 1:
         num_tokens = page_indices.shape[0]
         data = staging_tensor.reshape(num_tokens, num_heads, head_dim)
-        kv_buffer_tensor[page_indices, head_start:head_start + num_heads, :] = data
+        kv_buffer_tensor[page_indices, head_start : head_start + num_heads, :] = data
     else:
         num_tokens = page_indices.shape[0] * page_size
         offsets = torch.arange(page_size, device=page_indices.device)
         token_indices = (page_indices.unsqueeze(1) * page_size + offsets).reshape(-1)
         data = staging_tensor.reshape(num_tokens, num_heads, head_dim)
-        kv_buffer_tensor[token_indices, head_start:head_start + num_heads, :] = data
+        kv_buffer_tensor[token_indices, head_start : head_start + num_heads, :] = data
 
 
 def gather_all_layers_to_staging(
@@ -336,9 +338,9 @@ def gather_all_layers_to_staging(
     per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
 
     torch.cuda.set_device(gpu_id)
-    page_idx_tensor = torch.from_numpy(
-        page_indices_np.astype(np.int64)
-    ).to(f"cuda:{gpu_id}")
+    page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(
+        f"cuda:{gpu_id}"
+    )
 
     if not hasattr(staging_buffer, "_gather_stream"):
         staging_buffer._gather_stream = torch.cuda.Stream(device=f"cuda:{gpu_id}")
@@ -352,21 +354,33 @@ def gather_all_layers_to_staging(
     offset = 0
     with torch.cuda.stream(staging_buffer._gather_stream):
         for layer_id in range(num_layers):
-            lv = staging_view[offset:offset + per_layer_bytes].view(
-                k_buffers[layer_id].dtype
-            ).reshape(num_tokens, num_heads, head_dim)
+            lv = (
+                staging_view[offset : offset + per_layer_bytes]
+                .view(k_buffers[layer_id].dtype)
+                .reshape(num_tokens, num_heads, head_dim)
+            )
             gather_kv_head_slices(
-                k_buffers[layer_id], page_idx_tensor,
-                src_head_start, num_heads, lv, page_size,
+                k_buffers[layer_id],
+                page_idx_tensor,
+                src_head_start,
+                num_heads,
+                lv,
+                page_size,
             )
             offset += per_layer_bytes
         for layer_id in range(num_layers):
-            lv = staging_view[offset:offset + per_layer_bytes].view(
-                v_buffers[layer_id].dtype
-            ).reshape(num_tokens, num_heads, head_dim)
+            lv = (
+                staging_view[offset : offset + per_layer_bytes]
+                .view(v_buffers[layer_id].dtype)
+                .reshape(num_tokens, num_heads, head_dim)
+            )
             gather_kv_head_slices(
-                v_buffers[layer_id], page_idx_tensor,
-                src_head_start, num_heads, lv, page_size,
+                v_buffers[layer_id],
+                page_idx_tensor,
+                src_head_start,
+                num_heads,
+                lv,
+                page_size,
             )
             offset += per_layer_bytes
 
@@ -403,8 +417,11 @@ def scatter_staging_to_kv(
 
     for writer_rank in range(num_writers):
         _, num_heads, dst_head_start, _ = compute_head_slice_params(
-            prefill_attn_tp_size, decode_attn_tp_size,
-            writer_rank, dst_tp_rank, total_kv_heads,
+            prefill_attn_tp_size,
+            decode_attn_tp_size,
+            writer_rank,
+            dst_tp_rank,
+            total_kv_heads,
         )
         per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
         per_rank_bytes = per_layer_bytes * num_layers * 2
@@ -412,21 +429,33 @@ def scatter_staging_to_kv(
 
         offset = rank_base
         for layer_id in range(num_layers):
-            layer_data = staging_buffer_view[offset:offset + per_layer_bytes].view(
-                k_buffers[layer_id].dtype
-            ).reshape(num_tokens, num_heads, head_dim)
+            layer_data = (
+                staging_buffer_view[offset : offset + per_layer_bytes]
+                .view(k_buffers[layer_id].dtype)
+                .reshape(num_tokens, num_heads, head_dim)
+            )
             scatter_kv_head_slices(
-                layer_data, k_buffers[layer_id],
-                page_idx_tensor, dst_head_start, num_heads, page_size,
+                layer_data,
+                k_buffers[layer_id],
+                page_idx_tensor,
+                dst_head_start,
+                num_heads,
+                page_size,
             )
             offset += per_layer_bytes
         for layer_id in range(num_layers):
-            layer_data = staging_buffer_view[offset:offset + per_layer_bytes].view(
-                v_buffers[layer_id].dtype
-            ).reshape(num_tokens, num_heads, head_dim)
+            layer_data = (
+                staging_buffer_view[offset : offset + per_layer_bytes]
+                .view(v_buffers[layer_id].dtype)
+                .reshape(num_tokens, num_heads, head_dim)
+            )
             scatter_kv_head_slices(
-                layer_data, v_buffers[layer_id],
-                page_idx_tensor, dst_head_start, num_heads, page_size,
+                layer_data,
+                v_buffers[layer_id],
+                page_idx_tensor,
+                dst_head_start,
+                num_heads,
+                page_size,
             )
             offset += per_layer_bytes
 
@@ -456,7 +485,9 @@ def compute_head_slice_params(
         unique_head_idx = local_tp_rank // src_replication
         dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
     else:
-        src_head_start = (dst_tp_rank_in_group * dst_heads_per_rank) % src_heads_per_rank
+        src_head_start = (
+            dst_tp_rank_in_group * dst_heads_per_rank
+        ) % src_heads_per_rank
         num_heads_to_send = dst_heads_per_rank
         dst_head_start = 0
 
@@ -486,7 +517,11 @@ def compute_staging_layout(
     writer_bytes = []
     for wr in range(num_writers):
         _, nh, _, _ = compute_head_slice_params(
-            src_attn_tp_size, dst_attn_tp_size, wr, dst_tp_rank, total_kv_heads,
+            src_attn_tp_size,
+            dst_attn_tp_size,
+            wr,
+            dst_tp_rank,
+            total_kv_heads,
         )
         writer_bytes.append(num_tokens * nh * bytes_per_head_token * num_layers * 2)
     return num_writers, writer_bytes, sum(writer_bytes)
@@ -518,8 +553,13 @@ def allocate_chunk_staging(
         cp = min(remaining, chunk_pages)
         chunk_tokens = cp * page_size
         _, _, required = compute_staging_layout(
-            prefill_attn_tp, decode_attn_tp, dst_tp_rank, total_kv_heads,
-            chunk_tokens, bytes_per_head_per_token, num_kv_layers,
+            prefill_attn_tp,
+            decode_attn_tp,
+            dst_tp_rank,
+            total_kv_heads,
+            chunk_tokens,
+            bytes_per_head_per_token,
+            num_kv_layers,
         )
         result = allocator.assign(required)
         if result is not None:
@@ -551,7 +591,11 @@ def resolve_total_kv_heads(
     if per_rank > 0:
         return per_rank * attn_tp_size
     if kv_buffer_tensors is not None:
-        k_bufs = kv_buffer_tensors.get("k_buffers") if isinstance(kv_buffer_tensors, dict) else None
+        k_bufs = (
+            kv_buffer_tensors.get("k_buffers")
+            if isinstance(kv_buffer_tensors, dict)
+            else None
+        )
         if k_bufs and len(k_bufs) > 0:
             return int(k_bufs[0].shape[1]) * max(1, attn_tp_size)
     raise ValueError(

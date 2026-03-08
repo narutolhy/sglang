@@ -364,7 +364,9 @@ class DecodePreallocQueue:
                 kv_pool = kv_pool.full_kv_pool
             if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
                 kv_manager.set_kv_buffer_tensors(
-                    kv_pool.k_buffer, kv_pool.v_buffer, kv_pool.page_size,
+                    kv_pool.k_buffer,
+                    kv_pool.v_buffer,
+                    kv_pool.page_size,
                 )
             # Prefill uses tp_size with dp_size=1, so prefill_attn_tp = tp_size.
             # Decode and prefill share the same tp_size (same GPU count per node).
@@ -922,8 +924,7 @@ class DecodeTransferQueue:
         return True
 
     def _init_staging_ctx(self):
-        """Initialize staging context after kv_manager is available.
-        """
+        """Initialize staging context after kv_manager is available."""
         kv_manager = getattr(self.scheduler, "_decode_kv_manager", None)
         if kv_manager is None:
             return
@@ -938,12 +939,19 @@ class DecodeTransferQueue:
         if prefill_tp == 0 or prefill_tp == decode_tp:
             return
         from sglang.srt.disaggregation.common.staging import resolve_total_kv_heads
+
         total_kv_heads = resolve_total_kv_heads(
-            kv_manager.kv_args, decode_tp, kv_buffer_tensors=kv_buffer_info,
+            kv_manager.kv_args,
+            decode_tp,
+            kv_buffer_tensors=kv_buffer_info,
         )
         self.staging_ctx = (
-            kv_manager, staging_allocator, kv_buffer_info,
-            prefill_tp, decode_tp, total_kv_heads,
+            kv_manager,
+            staging_allocator,
+            kv_buffer_info,
+            prefill_tp,
+            decode_tp,
+            total_kv_heads,
         )
 
     def _scatter_staging_region(
@@ -961,7 +969,14 @@ class DecodeTransferQueue:
         ctx = self.staging_ctx
         if ctx is None:
             return False
-        kv_manager, staging_allocator, kv_buffer_info, prefill_tp, decode_tp, total_kv_heads = ctx
+        (
+            kv_manager,
+            staging_allocator,
+            kv_buffer_info,
+            prefill_tp,
+            decode_tp,
+            total_kv_heads,
+        ) = ctx
 
         from sglang.srt.disaggregation.common.staging import scatter_staging_to_kv
 
@@ -978,6 +993,7 @@ class DecodeTransferQueue:
         ]
         if page_size > 1:
             from sglang.srt.disaggregation.utils import kv_to_page_indices
+
             kv_indices = kv_to_page_indices(kv_indices.cpu().numpy(), page_size)
             page_idx_tensor = torch.from_numpy(kv_indices).to(k_buffers[0].device)
         else:
@@ -992,8 +1008,15 @@ class DecodeTransferQueue:
 
         with torch.cuda.stream(staging_allocator._scatter_stream):
             scatter_staging_to_kv(
-                staging_view, k_buffers, v_buffers, page_idx_tensor, page_size,
-                prefill_tp, decode_tp, dst_tp_rank, total_kv_heads,
+                staging_view,
+                k_buffers,
+                v_buffers,
+                page_idx_tensor,
+                page_size,
+                prefill_tp,
+                decode_tp,
+                dst_tp_rank,
+                total_kv_heads,
             )
         return True
 
@@ -1022,8 +1045,11 @@ class DecodeTransferQueue:
         total_pages = (seq_len + ps - 1) // ps
 
         n = len(chunk_infos)
-        prefill_cps = getattr(kv_manager, "prefill_chunked_prefill_size", None) \
-            or self.scheduler.server_args.chunked_prefill_size or 8192
+        prefill_cps = (
+            getattr(kv_manager, "prefill_chunked_prefill_size", None)
+            or self.scheduler.server_args.chunked_prefill_size
+            or 8192
+        )
         chunk_pages = max(1, prefill_cps // ps)
         page_start = chunk_pages * (n - 1)
         last_num_pages = total_pages - page_start
@@ -1041,19 +1067,25 @@ class DecodeTransferQueue:
         _, staging_allocator, _, _, _, _ = ctx
         staging_allocator.free(alloc_id)
         receiver = decode_req.kv_receiver
-        if receiver is not None and hasattr(receiver, "bootstrap_infos") and receiver.bootstrap_infos:
+        if (
+            receiver is not None
+            and hasattr(receiver, "bootstrap_infos")
+            and receiver.bootstrap_infos
+        ):
             wm_round, wm_tail = staging_allocator.get_watermark()
             session_id = getattr(receiver, "session_id", "")
             for bootstrap_info in receiver.bootstrap_infos:
                 try:
                     sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
                     with lock:
-                        sock.send_multipart([
-                            b"WATERMARK",
-                            str(wm_round).encode("ascii"),
-                            str(wm_tail).encode("ascii"),
-                            session_id.encode("ascii"),
-                        ])
+                        sock.send_multipart(
+                            [
+                                b"WATERMARK",
+                                str(wm_round).encode("ascii"),
+                                str(wm_tail).encode("ascii"),
+                                session_id.encode("ascii"),
+                            ]
+                        )
                 except Exception:
                     pass
 
@@ -1078,10 +1110,15 @@ class DecodeTransferQueue:
         if not pending:
             return
 
-        num_writers = prefill_attn_tp // max(1, decode_attn_tp) if prefill_attn_tp > decode_attn_tp else 1
+        num_writers = (
+            prefill_attn_tp // max(1, decode_attn_tp)
+            if prefill_attn_tp > decode_attn_tp
+            else 1
+        )
 
         room_to_req = {
-            dr.req.bootstrap_room: dr for dr in self.queue
+            dr.req.bootstrap_room: dr
+            for dr in self.queue
             if dr.req.bootstrap_room in pending
         }
 
@@ -1151,7 +1188,11 @@ class DecodeTransferQueue:
             decode_req._chunk_events = remaining
 
     def _try_commit_and_finalize(
-        self, decode_req: DecodeRequest, indices_to_remove, transferred_reqs, i: int,
+        self,
+        decode_req: DecodeRequest,
+        indices_to_remove,
+        transferred_reqs,
+        i: int,
     ):
         """Commit transfer and handle abort/success bookkeeping. Returns True if removed."""
         should_remove = self._commit_transfer_to_req(decode_req)
@@ -1190,7 +1231,10 @@ class DecodeTransferQueue:
                     continue  # Scatter still running on GPU, check next iteration.
                 self._complete_async_scatter(decode_req)
                 self._try_commit_and_finalize(
-                    decode_req, indices_to_remove, transferred_reqs, i,
+                    decode_req,
+                    indices_to_remove,
+                    transferred_reqs,
+                    i,
                 )
                 continue
 
@@ -1217,7 +1261,9 @@ class DecodeTransferQueue:
             elif poll == KVPoll.Success:
                 slot_id = self._submit_scatter_staging(decode_req)
                 if slot_id >= 0:
-                    scatter_stream = getattr(self.staging_ctx[1], "_scatter_stream", None)
+                    scatter_stream = getattr(
+                        self.staging_ctx[1], "_scatter_stream", None
+                    )
                     event = torch.cuda.Event()
                     if scatter_stream is not None:
                         event.record(scatter_stream)
@@ -1225,7 +1271,10 @@ class DecodeTransferQueue:
                     decode_req._scatter_alloc_id = slot_id
                     continue
                 self._try_commit_and_finalize(
-                    decode_req, indices_to_remove, transferred_reqs, i,
+                    decode_req,
+                    indices_to_remove,
+                    transferred_reqs,
+                    i,
                 )
             elif poll in [
                 KVPoll.Bootstrapping,

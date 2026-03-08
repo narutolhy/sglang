@@ -214,7 +214,9 @@ class PrefillBootstrapQueue:
                 kv_pool = kv_pool.full_kv_pool
             if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
                 kv_manager.set_kv_buffer_tensors(
-                    kv_pool.k_buffer, kv_pool.v_buffer, kv_pool.page_size,
+                    kv_pool.k_buffer,
+                    kv_pool.v_buffer,
+                    kv_pool.page_size,
                 )
         return kv_manager
 
