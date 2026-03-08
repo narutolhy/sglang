@@ -1114,6 +1114,13 @@ class DecodeTransferQueue:
             if dr.req.bootstrap_room in pending
         }
 
+        prefill_attn_tp = getattr(kv_manager, "prefill_attn_tp_size", 0)
+        decode_attn_tp = kv_manager.attn_tp_size
+        if prefill_attn_tp > decode_attn_tp:
+            num_writers = prefill_attn_tp // max(1, decode_attn_tp)
+        else:
+            num_writers = 1
+
         processed_rooms = []
         for room, chunks in pending.items():
             decode_req = room_to_req.get(room)
@@ -1126,12 +1133,40 @@ class DecodeTransferQueue:
             if not hasattr(decode_req, "_chunk_events"):
                 decode_req._chunk_events = []
 
-            for chunk_idx, page_start, num_pages, _ in chunks:
+            from collections import defaultdict
+            by_chunk = defaultdict(list)
+            for chunk in chunks:
+                by_chunk[chunk[0]].append(chunk)
+
+            remaining = []
+            for chunk_idx, group in by_chunk.items():
                 if chunk_idx >= len(chunk_infos):
                     continue
-                alloc_id, staging_offset, _, _ = chunk_infos[chunk_idx]
+                alloc_id, staging_offset, staging_round, _ = chunk_infos[chunk_idx]
                 if staging_offset < 0:
                     continue
+                if len(group) < num_writers:
+                    remaining.extend(group)
+                    continue
+
+                page_start = group[0][1]
+                num_pages = group[0][2]
+                # self._trace_staging(
+                #     "chunk_ready_scatter_submit",
+                #     decode_req,
+                #     chunk_idx=chunk_idx,
+                #     alloc_id=alloc_id,
+                #     staging_offset=staging_offset,
+                #     staging_round=staging_round,
+                #     page_start=page_start,
+                #     num_pages=num_pages,
+                #     arrived_ranks=len(group),
+                #     required_ranks=num_writers,
+                # )
+                # self._stg_record_alloc_stage(decode_req, alloc_id, "submit")
+                # self._stg_register_region(
+                #     decode_req, alloc_id, staging_offset, staging_round
+                # )
                 ok = self._scatter_staging_region(
                     staging_offset, page_start, num_pages, decode_req
                 )
@@ -1142,7 +1177,11 @@ class DecodeTransferQueue:
                         event.record(scatter_stream)
                     decode_req._chunk_events.append((event, alloc_id))
                     chunk_infos[chunk_idx] = (-1, -1, 0, -1)
-            processed_rooms.append(room)
+
+            if remaining:
+                pending[room] = remaining
+            else:
+                processed_rooms.append(room)
 
         for room in processed_rooms:
             pending.pop(room, None)
