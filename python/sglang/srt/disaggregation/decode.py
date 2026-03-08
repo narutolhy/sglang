@@ -368,6 +368,16 @@ class DecodePreallocQueue:
             # Prefill uses tp_size with dp_size=1, so prefill_attn_tp = tp_size.
             # Decode and prefill share the same tp_size (same GPU count per node).
             kv_manager.prefill_attn_tp_size = self.tp_size
+            # Prefill's chunked_prefill_size is the value before DP attention
+            # adjustment (which divides by dp_size).  Prefill has dp_size=1 so
+            # its value equals the original configured value.
+            server_args = self.scheduler.server_args
+            dp = self.dp_size or 1
+            cps = server_args.chunked_prefill_size or 8192
+            if getattr(server_args, "enable_dp_attention", False) and dp > 1:
+                kv_manager.prefill_chunked_prefill_size = cps * dp
+            else:
+                kv_manager.prefill_chunked_prefill_size = cps
         self.scheduler._decode_kv_manager = kv_manager
         return kv_manager
 
@@ -1040,7 +1050,11 @@ class DecodeTransferQueue:
         total_pages = (seq_len + ps - 1) // ps
 
         n = len(chunk_infos)
-        page_start = total_pages - (total_pages // n + (1 if (n - 1) < total_pages % n else 0))
+        kv_manager = getattr(self.scheduler, "_decode_kv_manager", None)
+        prefill_cps = getattr(kv_manager, "prefill_chunked_prefill_size", None) \
+            or self.scheduler.server_args.chunked_prefill_size or 8192
+        chunk_pages = max(1, prefill_cps // ps)
+        page_start = chunk_pages * (n - 1)
         last_num_pages = total_pages - page_start
 
         ok = self._scatter_staging_region(

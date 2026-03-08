@@ -1062,7 +1062,7 @@ class MooncakeKVManager(CommonKVManager):
                                 f"has_staging={has_staging} "
                                 f"(base_ptr={target_rank_registration_info.dst_staging_base_ptr}, "
                                 f"offset={req.staging_offset}), "
-                                f"kv_buffer_tensors={self.kv_buffer_tensors is not None}"
+                                f"kv_buffer_tensors={getattr(self, 'kv_buffer_tensors', None) is not None}"
                             )
                         if tp_match:
                             ret = self.send_kvcache(
@@ -1681,7 +1681,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 else 1
             )
 
-            chunked_prefill_size = self.kv_mgr.server_args.chunked_prefill_size or 8192
+            chunked_prefill_size = getattr(
+                self.kv_mgr, "prefill_chunked_prefill_size", None
+            ) or self.kv_mgr.server_args.chunked_prefill_size or 8192
             chunk_pages = max(1, chunked_prefill_size // page_size)
             remaining = num_pages
             while remaining > 0:
