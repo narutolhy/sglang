@@ -1132,22 +1132,7 @@ class DecodeTransferQueue:
         if not hasattr(staging_allocator, "_scatter_stream"):
             staging_allocator._scatter_stream = torch.cuda.Stream()
 
-        num_layers = len(k_buffers)
-        head_dim = k_buffers[0].shape[-1]
-        dtype_size = k_buffers[0].element_size()
-        num_tokens = page_idx_tensor.shape[0] * page_size
-        num_writers = (
-            prefill_tp // max(1, decode_tp) if prefill_tp > decode_tp else 1
-        )
-        from sglang.srt.disaggregation.common.staging import compute_head_slice_params
-
-        total_region_bytes = 0
-        for wr in range(num_writers):
-            _, nh, _, _ = compute_head_slice_params(
-                prefill_tp, decode_tp, wr, dst_tp_rank, total_kv_heads
-            )
-            total_region_bytes += num_tokens * nh * head_dim * dtype_size * num_layers * 2
-        staging_view[max(0, total_region_bytes - 1)].item()
+        staging_view[0].item()
 
         if os.getenv("SGLANG_STG_TRACE", "0") == "1":
             self._e2e_verify_staging(
