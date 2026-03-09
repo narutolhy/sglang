@@ -1131,6 +1131,17 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info.dst_kv_item_len,
                                     executor,
                                 )
+                            elif ret == 0 and os.getenv("SGLANG_STG_TRACE", "0") == "1":
+                                self.send_kvcache_slice(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    target_rank_registration_info.dst_tp_rank,
+                                    target_rank_registration_info.dst_attn_tp_size,
+                                    target_rank_registration_info.dst_kv_item_len,
+                                    executor,
+                                )
                         else:
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,

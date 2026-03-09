@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -967,6 +968,97 @@ class DecodeTransferQueue:
             total_kv_heads,
         )
 
+    def _e2e_verify_staging(
+        self,
+        staging_view,
+        k_buffers, v_buffers,
+        page_idx_tensor, page_size,
+        prefill_tp, decode_tp, dst_tp_rank,
+        total_kv_heads,
+        staging_offset, num_pages,
+        decode_req,
+    ):
+        """Compare staging buffer vs KV cache (written by slice ground truth).
+
+        Only runs when SGLANG_STG_TRACE=1 and prefill double-writes.
+        """
+        from sglang.srt.disaggregation.common.staging import compute_head_slice_params
+
+        num_layers = len(k_buffers)
+        head_dim = k_buffers[0].shape[-1]
+        dtype_size = k_buffers[0].element_size()
+        num_tokens = page_idx_tensor.shape[0] * page_size
+
+        if page_size > 1:
+            offsets = torch.arange(page_size, device=page_idx_tensor.device)
+            token_indices = (
+                page_idx_tensor.unsqueeze(1) * page_size + offsets
+            ).reshape(-1)
+        else:
+            token_indices = page_idx_tensor
+
+        num_writers = (
+            prefill_tp // max(1, decode_tp) if prefill_tp > decode_tp else 1
+        )
+
+        torch.cuda.synchronize()
+        mismatch_total = 0
+        for writer_rank in range(num_writers):
+            _, nh, dhs, _ = compute_head_slice_params(
+                prefill_tp, decode_tp, writer_rank, dst_tp_rank, total_kv_heads
+            )
+            plb = num_tokens * nh * head_dim * dtype_size
+            prb = plb * num_layers * 2
+            rb = writer_rank * prb
+            off = rb
+            for lid in range(num_layers):
+                stg = staging_view[off : off + plb]
+                kv_slice = k_buffers[lid][token_indices, dhs : dhs + nh, :]
+                kv_bytes = kv_slice.contiguous().view(-1).view(torch.uint8)
+                if not torch.equal(stg, kv_bytes):
+                    diff = (stg != kv_bytes).sum().item()
+                    mismatch_total += 1
+                    if mismatch_total <= 5:
+                        logger.error(
+                            f"[E2E MISMATCH] K layer {lid} writer {writer_rank} "
+                            f"dst_head={dhs}: {diff}/{kv_bytes.numel()} bytes differ "
+                            f"stg_sum={stg.sum(dtype=torch.int64).item()} "
+                            f"kv_sum={kv_bytes.sum(dtype=torch.int64).item()} "
+                            f"room={decode_req.req.bootstrap_room} "
+                            f"rank={dst_tp_rank} offset={staging_offset}"
+                        )
+                off += plb
+            for lid in range(num_layers):
+                stg = staging_view[off : off + plb]
+                kv_slice = v_buffers[lid][token_indices, dhs : dhs + nh, :]
+                kv_bytes = kv_slice.contiguous().view(-1).view(torch.uint8)
+                if not torch.equal(stg, kv_bytes):
+                    diff = (stg != kv_bytes).sum().item()
+                    mismatch_total += 1
+                    if mismatch_total <= 5:
+                        logger.error(
+                            f"[E2E MISMATCH] V layer {lid} writer {writer_rank} "
+                            f"dst_head={dhs}: {diff}/{kv_bytes.numel()} bytes differ "
+                            f"stg_sum={stg.sum(dtype=torch.int64).item()} "
+                            f"kv_sum={kv_bytes.sum(dtype=torch.int64).item()} "
+                            f"room={decode_req.req.bootstrap_room} "
+                            f"rank={dst_tp_rank} offset={staging_offset}"
+                        )
+                off += plb
+        if mismatch_total > 0:
+            logger.error(
+                f"[E2E MISMATCH] TOTAL: {mismatch_total} layers mismatched | "
+                f"rid={decode_req.req.rid} room={decode_req.req.bootstrap_room} "
+                f"rank={dst_tp_rank} tokens={num_tokens} writers={num_writers} "
+                f"prefill_tp={prefill_tp} decode_tp={decode_tp} "
+                f"kv_heads={total_kv_heads} offset={staging_offset}"
+            )
+        else:
+            logger.info(
+                f"[E2E OK] room={decode_req.req.bootstrap_room} "
+                f"rank={dst_tp_rank} tokens={num_tokens} offset={staging_offset}"
+            )
+
     def _scatter_staging_region(
         self,
         staging_offset: int,
@@ -1018,6 +1110,13 @@ class DecodeTransferQueue:
             staging_allocator._scatter_stream = torch.cuda.Stream()
 
         staging_view[0].item()
+
+        if os.getenv("SGLANG_STG_TRACE", "0") == "1":
+            self._e2e_verify_staging(
+                staging_view, k_buffers, v_buffers, page_idx_tensor,
+                page_size, prefill_tp, decode_tp, dst_tp_rank,
+                total_kv_heads, staging_offset, num_pages, decode_req,
+            )
 
         with torch.cuda.stream(staging_allocator._scatter_stream):
             scatter_staging_to_kv(
