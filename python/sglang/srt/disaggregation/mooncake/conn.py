@@ -343,6 +343,16 @@ class MooncakeKVManager(CommonKVManager):
             "page_size": page_size,
         }
 
+    def _is_watermark_ready(self, session_id: str, alloc_round: int, alloc_end: int) -> bool:
+        """Non-blocking check: is the staging region safe to write?"""
+        if alloc_round <= 0:
+            return True
+        prev_round = alloc_round - 1
+        wm_round, wm_tail = self.remote_watermarks.get(session_id, (0, 0))
+        return prev_round < wm_round or (
+            prev_round == wm_round and alloc_end <= wm_tail
+        )
+
     def _wait_for_watermark(self, session_id: str, alloc_round: int, alloc_end: int):
         """Block until the previous round's occupant of this staging region is freed.
 
@@ -1007,6 +1017,7 @@ class MooncakeKVManager(CommonKVManager):
                 polls = []
                 dst_ranks_infos = []
                 local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
+                watermark_deferred = False
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -1086,11 +1097,12 @@ class MooncakeKVManager(CommonKVManager):
                             c_round = req.staging_rounds[chunk_idx]
                             c_end = req.staging_ends[chunk_idx]
 
-                            self._wait_for_watermark(
-                                req.mooncake_session_id,
-                                c_round,
-                                c_end,
-                            )
+                            if not self._is_watermark_ready(
+                                req.mooncake_session_id, c_round, c_end
+                            ):
+                                queue.put(kv_chunk)
+                                watermark_deferred = True
+                                break
 
                             dst_staging_ptr = (
                                 target_rank_registration_info.dst_staging_base_ptr
@@ -1231,6 +1243,9 @@ class MooncakeKVManager(CommonKVManager):
                         # Dummy request does not need to sync status to decode endpoint
                         if kv_chunk.is_last and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
+
+                if watermark_deferred:
+                    continue
 
                 if (
                     kv_chunk.room not in self.request_status
