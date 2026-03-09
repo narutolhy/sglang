@@ -253,15 +253,13 @@ class MooncakeKVManager(CommonKVManager):
                     daemon=True,
                 ).start()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.start_decode_thread()
+            self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
             self.staging_buffers = []
             self.staging_allocator = None
-            self.pending_chunk_scatters = (
-                {}
-            )  # room → [(chunk_idx, page_start, num_pages, session_id)]
-            self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            self.pending_chunk_scatters = {}
             if self.enable_staging:
                 self._init_staging_allocator()
+            self.start_decode_thread()
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -416,7 +414,8 @@ class MooncakeKVManager(CommonKVManager):
             head_dim * dtype_size,
             num_layers,
         )
-        rank_offset = sum(writer_rank_bytes[:local_tp_rank]) if num_writers > 1 else 0
+        writer_idx = local_tp_rank % num_writers if num_writers > 1 else 0
+        rank_offset = sum(writer_rank_bytes[:writer_idx])
 
         if not staging_buffer.fits(per_rank_bytes):
             logger.warning(

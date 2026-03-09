@@ -27,6 +27,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
@@ -368,19 +369,10 @@ class DecodePreallocQueue:
                     kv_pool.v_buffer,
                     kv_pool.page_size,
                 )
-            # Prefill uses tp_size with dp_size=1, so prefill_attn_tp = tp_size.
-            # Decode and prefill share the same tp_size (same GPU count per node).
-            kv_manager.prefill_attn_tp_size = self.tp_size
-            # Prefill's chunked_prefill_size is the value before DP attention
-            # adjustment (which divides by dp_size).  Prefill has dp_size=1 so
-            # its value equals the original configured value.
-            server_args = self.scheduler.server_args
-            dp = self.dp_size or 1
-            cps = server_args.chunked_prefill_size or 8192
-            if getattr(server_args, "enable_dp_attention", False) and dp > 1:
-                kv_manager.prefill_chunked_prefill_size = cps * dp
-            else:
-                kv_manager.prefill_chunked_prefill_size = cps
+            # Both will be set from actual prefill info in
+            # _resolve_pending_reqs after ensure_parallel_info succeeds.
+            kv_manager.prefill_attn_tp_size = 0
+            kv_manager.prefill_chunked_prefill_size = 0
         self.scheduler._decode_kv_manager = kv_manager
         return kv_manager
 
@@ -498,10 +490,16 @@ class DecodePreallocQueue:
     def _update_handshake_waiters(
         self, rids_to_check: Optional[List[str]] = None
     ) -> None:
-        if not self.queue:
-            return
-
-        if all(decode_req.waiting_for_input for decode_req in self.queue):
+        should_poll = (
+            len(self.queue) > 0
+            and not all(d.waiting_for_input for d in self.queue)
+        )
+        n = len(self.queue)
+        guard = torch.tensor(
+            [int(should_poll), n, -n], dtype=torch.int64, device="cpu"
+        )
+        dist.all_reduce(guard, op=dist.ReduceOp.MIN, group=self.gloo_group)
+        if guard[0].item() == 0 or guard[1].item() != -guard[2].item():
             return
 
         polls = poll_and_all_reduce(
@@ -546,6 +544,21 @@ class DecodePreallocQueue:
         # so we need to ensure the parallel info before resolving it.
         if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
             return
+
+        if self.kv_manager.prefill_attn_tp_size == 0:
+            prefill_info = self.kv_manager.prefill_info_table.get(bootstrap_addr)
+            if prefill_info is not None:
+                self.kv_manager.prefill_attn_tp_size = prefill_info.attn_tp_size
+                server_args = self.scheduler.server_args
+                decode_dp = self.dp_size or 1
+                decode_cps = server_args.chunked_prefill_size
+                if getattr(server_args, "enable_dp_attention", False) and decode_dp > 1:
+                    original_cps = decode_cps * decode_dp
+                else:
+                    original_cps = decode_cps
+                prefill_dp = prefill_info.dp_size or 1
+                self.kv_manager.prefill_chunked_prefill_size = original_cps // prefill_dp
+                self.transfer_queue._init_staging_ctx()
 
         resolved = []
         need_query = []
@@ -1123,7 +1136,7 @@ class DecodeTransferQueue:
         }
 
         processed_rooms = []
-        for room, chunks in pending.items():
+        for room, chunks in list(pending.items()):
             decode_req = room_to_req.get(room)
             if decode_req is None:
                 continue
@@ -1213,7 +1226,14 @@ class DecodeTransferQueue:
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         self._process_pending_chunk_scatters()
 
-        if not self.queue:
+        n = len(self.queue)
+        guard = torch.tensor(
+            [1 if self.queue else 0, n, -n],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        dist.all_reduce(guard, op=dist.ReduceOp.MIN, group=self.gloo_group)
+        if guard[0].item() == 0 or guard[1].item() != -guard[2].item():
             return []
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
