@@ -1153,7 +1153,97 @@ class DecodeTransferQueue:
                 dst_tp_rank,
                 total_kv_heads,
             )
+
+        if os.getenv("SGLANG_STG_TRACE", "0") == "1":
+            staging_allocator._scatter_stream.synchronize()
+            self._post_scatter_verify(
+                staging_view, k_buffers, v_buffers, page_idx_tensor,
+                page_size, prefill_tp, decode_tp, dst_tp_rank,
+                total_kv_heads, num_pages, decode_req,
+            )
+
         return True
+
+    def _post_scatter_verify(
+        self,
+        staging_view,
+        k_buffers, v_buffers,
+        page_idx_tensor, page_size,
+        prefill_tp, decode_tp, dst_tp_rank,
+        total_kv_heads,
+        num_pages,
+        decode_req,
+    ):
+        """Compare KV cache AFTER scatter vs staging buffer.
+
+        Catches bugs in scatter_staging_to_kv (e.g. wrong head placement).
+        """
+        from sglang.srt.disaggregation.common.staging import compute_head_slice_params
+
+        num_layers = len(k_buffers)
+        head_dim = k_buffers[0].shape[-1]
+        dtype_size = k_buffers[0].element_size()
+        num_tokens = page_idx_tensor.shape[0] * page_size
+
+        if page_size > 1:
+            offsets = torch.arange(page_size, device=page_idx_tensor.device)
+            token_indices = (
+                page_idx_tensor.unsqueeze(1) * page_size + offsets
+            ).reshape(-1)
+        else:
+            token_indices = page_idx_tensor
+
+        num_writers = (
+            prefill_tp // max(1, decode_tp) if prefill_tp > decode_tp else 1
+        )
+
+        rid = getattr(decode_req.req, "rid", "?")
+        room = getattr(decode_req.req, "bootstrap_room", "?")
+
+        mismatch_layers = []
+        for writer_rank in range(num_writers):
+            _, nh, dhs, _ = compute_head_slice_params(
+                prefill_tp, decode_tp, writer_rank, dst_tp_rank, total_kv_heads
+            )
+            plb = num_tokens * nh * head_dim * dtype_size
+            prb = plb * num_layers * 2
+            off = writer_rank * prb
+            for lid in range(num_layers):
+                stg = staging_view[off : off + plb]
+                kv_slice = k_buffers[lid][token_indices, dhs : dhs + nh, :]
+                kv_bytes = kv_slice.contiguous().view(-1).view(torch.uint8)
+                if not torch.equal(stg, kv_bytes):
+                    diff = (stg != kv_bytes).sum().item()
+                    mismatch_layers.append(
+                        f"K{lid} w{writer_rank} head={dhs} diff={diff}/{kv_bytes.numel()}"
+                    )
+                off += plb
+            for lid in range(num_layers):
+                stg = staging_view[off : off + plb]
+                kv_slice = v_buffers[lid][token_indices, dhs : dhs + nh, :]
+                kv_bytes = kv_slice.contiguous().view(-1).view(torch.uint8)
+                if not torch.equal(stg, kv_bytes):
+                    diff = (stg != kv_bytes).sum().item()
+                    mismatch_layers.append(
+                        f"V{lid} w{writer_rank} head={dhs} diff={diff}/{kv_bytes.numel()}"
+                    )
+                off += plb
+
+        if mismatch_layers:
+            logger.error(
+                f"[POST-SCATTER MISMATCH] {len(mismatch_layers)} layers | "
+                f"rid={rid} room={room} "
+                f"prefill_tp={prefill_tp} decode_tp={decode_tp} "
+                f"dst_tp_rank={dst_tp_rank} kv_heads={total_kv_heads} "
+                f"tokens={num_tokens} pages={num_pages}\n"
+                + "\n".join(f"  {m}" for m in mismatch_layers)
+            )
+        else:
+            logger.info(
+                f"[POST-SCATTER OK] rid={rid} room={room} "
+                f"prefill_tp={prefill_tp} decode_tp={decode_tp} "
+                f"tokens={num_tokens} pages={num_pages}"
+            )
 
     def _submit_scatter_staging(self, decode_req: DecodeRequest) -> int:
         """Submit scatter for the last chunk (triggered by KVPoll.Success).
@@ -1200,14 +1290,29 @@ class DecodeTransferQueue:
         if ctx is None:
             return
         _, staging_allocator, _, _, _, _ = ctx
+        pre_wm = staging_allocator.get_watermark()
+        num_allocs_before = len(staging_allocator.allocations)
         staging_allocator.free(alloc_id)
+        post_wm = staging_allocator.get_watermark()
+        num_allocs_after = len(staging_allocator.allocations)
+        logger.info(
+            "[WM-FREE] decode_tp=%d alloc_id=%d room=%s "
+            "wm_before=(%d,%d) wm_after=(%d,%d) allocs: %d->%d order_head=%s",
+            self.tp_rank,
+            alloc_id,
+            getattr(decode_req.req, "bootstrap_room", "?"),
+            pre_wm[0], pre_wm[1],
+            post_wm[0], post_wm[1],
+            num_allocs_before, num_allocs_after,
+            staging_allocator.alloc_order[0] if staging_allocator.alloc_order else "empty",
+        )
         receiver = decode_req.kv_receiver
         if (
             receiver is not None
             and hasattr(receiver, "bootstrap_infos")
             and receiver.bootstrap_infos
         ):
-            wm_round, wm_tail = staging_allocator.get_watermark()
+            wm_round, wm_tail = post_wm
             session_id = getattr(receiver, "session_id", "")
             for bootstrap_info in receiver.bootstrap_infos:
                 try:
@@ -1223,6 +1328,23 @@ class DecodeTransferQueue:
                         )
                 except Exception:
                     pass
+            logger.info(
+                "[WM-SEND] decode_tp=%d session=%s wm=(%d,%d) room=%s",
+                self.tp_rank,
+                session_id, wm_round, wm_tail,
+                getattr(decode_req.req, "bootstrap_room", "?"),
+            )
+        else:
+            logger.warning(
+                "[WM-SEND SKIP] decode_tp=%d alloc_id=%d room=%s receiver=%s "
+                "has_bootstrap_infos=%s — watermark NOT sent to prefill",
+                self.tp_rank,
+                alloc_id,
+                getattr(decode_req.req, "bootstrap_room", "?"),
+                "None" if receiver is None else "present",
+                hasattr(receiver, "bootstrap_infos") and bool(getattr(receiver, "bootstrap_infos", None))
+                if receiver is not None else False,
+            )
 
     def _complete_async_scatter(self, decode_req: DecodeRequest) -> None:
         """Wait for scatter event, then free staging and send watermark."""

@@ -363,14 +363,44 @@ class MooncakeKVManager(CommonKVManager):
         if alloc_round <= 0:
             return
         prev_round = alloc_round - 1
+        wait_start = time.monotonic()
+        poll_count = 0
         with self._watermark_cv:
+            wm_round, wm_tail = self.remote_watermarks.get(session_id, (0, 0))
+            if prev_round < wm_round or (
+                prev_round == wm_round and alloc_end <= wm_tail
+            ):
+                return
+            logger.info(
+                "[WM-WAIT] session=%s need prev_round=%d alloc_end=%d "
+                "current wm=(%d,%d) alloc_round=%d",
+                session_id, prev_round, alloc_end, wm_round, wm_tail, alloc_round,
+            )
             while True:
                 wm_round, wm_tail = self.remote_watermarks.get(session_id, (0, 0))
                 if prev_round < wm_round or (
                     prev_round == wm_round and alloc_end <= wm_tail
                 ):
                     break
+                poll_count += 1
+                if poll_count % 100 == 0:
+                    elapsed = time.monotonic() - wait_start
+                    logger.warning(
+                        "[WM-WAIT STALL] session=%s waiting %.1fs "
+                        "need prev_round=%d alloc_end=%d current wm=(%d,%d) "
+                        "polls=%d",
+                        session_id, elapsed, prev_round, alloc_end,
+                        wm_round, wm_tail, poll_count,
+                    )
                 self._watermark_cv.wait(timeout=0.1)
+        elapsed = time.monotonic() - wait_start
+        if elapsed > 0.5:
+            logger.info(
+                "[WM-WAIT DONE] session=%s waited %.3fs polls=%d "
+                "need prev_round=%d alloc_end=%d final wm=(%d,%d)",
+                session_id, elapsed, poll_count,
+                prev_round, alloc_end, wm_round, wm_tail,
+            )
 
     def send_kvcache_staged(
         self,
@@ -1100,6 +1130,44 @@ class MooncakeKVManager(CommonKVManager):
                             if not self._is_watermark_ready(
                                 req.mooncake_session_id, c_round, c_end
                             ):
+                                defer_key = (kv_chunk.room, req.mooncake_session_id)
+                                defer_times = getattr(self, "_wm_defer_times", {})
+                                defer_starts = getattr(self, "_wm_defer_starts", {})
+                                now = time.monotonic()
+                                if defer_key not in defer_starts:
+                                    defer_starts[defer_key] = now
+                                    self._wm_defer_starts = defer_starts
+                                last_log = defer_times.get(defer_key, 0)
+                                if now - last_log >= 1.0:
+                                    defer_times[defer_key] = now
+                                    self._wm_defer_times = defer_times
+                                    elapsed = now - defer_starts[defer_key]
+                                    wm_r, wm_t = self.remote_watermarks.get(
+                                        req.mooncake_session_id, (0, 0)
+                                    )
+                                    decode_info = self.decode_kv_args_table.get(
+                                        req.mooncake_session_id
+                                    )
+                                    dst_tp = (
+                                        getattr(decode_info, "dst_tp_rank", "?")
+                                        if decode_info
+                                        else "?"
+                                    )
+                                    logger.warning(
+                                        "[WM-DEFER] prefill_tp=%d room=%s "
+                                        "decode_tp=%s session=%s "
+                                        "need_round=%d need_end=%d "
+                                        "cur_wm=(%d,%d) waiting=%.1fs",
+                                        self.attn_tp_rank,
+                                        kv_chunk.room,
+                                        dst_tp,
+                                        req.mooncake_session_id,
+                                        c_round,
+                                        c_end,
+                                        wm_r,
+                                        wm_t,
+                                        elapsed,
+                                    )
                                 queue.put(kv_chunk)
                                 watermark_deferred = True
                                 break
@@ -1128,6 +1196,22 @@ class MooncakeKVManager(CommonKVManager):
                                     f"[Staging] KV transfer via staging buffer failed: {staging_err}. "
                                     f"room={kv_chunk.room}, session={req.mooncake_session_id}"
                                 ) from staging_err
+                            if ret == 0:
+                                logger.info(
+                                    "[STG-RDMA] prefill_tp=%d room=%s "
+                                    "-> decode_tp=%s session=%s "
+                                    "round=%d offset=%d end=%d "
+                                    "chunk_idx=%d is_last=%s",
+                                    self.attn_tp_rank,
+                                    kv_chunk.room,
+                                    target_rank_registration_info.dst_tp_rank,
+                                    req.mooncake_session_id,
+                                    c_round,
+                                    c_offset,
+                                    c_end,
+                                    chunk_idx,
+                                    kv_chunk.is_last,
+                                )
                             if ret == -1:
                                 logger.warning(
                                     f"[Staging] Falling back to per-token slice path "
@@ -1276,8 +1360,17 @@ class MooncakeKVManager(CommonKVManager):
                         else ""
                     )
                     with self._watermark_cv:
+                        prev = self.remote_watermarks.get(wm_session, (0, 0))
                         self.remote_watermarks[wm_session] = (wm_round, wm_tail)
                         self._watermark_cv.notify_all()
+                    decode_info = self.decode_kv_args_table.get(wm_session)
+                    dst_tp = getattr(decode_info, "dst_tp_rank", "?") if decode_info else "?"
+                    logger.info(
+                        "[WM-RECV] prefill_tp=%d prefill_dp=%d <- decode_tp=%s "
+                        "session=%s wm=(%d,%d) prev=(%d,%d)",
+                        self.attn_tp_rank, self.attn_dp_rank, dst_tp,
+                        wm_session, wm_round, wm_tail, prev[0], prev[1],
+                    )
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
@@ -1692,7 +1785,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
         )
         chunk_pages = max(1, chunked_prefill_size // page_size)
 
-        return allocate_chunk_staging(
+        pre_alloc_state = (
+            staging_allocator.round,
+            staging_allocator.head,
+            len(staging_allocator.allocations),
+        )
+
+        result = allocate_chunk_staging(
             staging_allocator,
             len(kv_indices),
             page_size,
@@ -1704,6 +1803,24 @@ class MooncakeKVReceiver(CommonKVReceiver):
             bytes_per_head_per_token,
             num_kv_layers,
         )
+
+        post_alloc_state = (
+            staging_allocator.round,
+            staging_allocator.head,
+            len(staging_allocator.allocations),
+        )
+        rounds_used = set(info[2] for info in result if info[0] >= 0)
+        logger.info(
+            "[STG-ALLOC] room=%s pages=%d chunks=%d "
+            "ring_before=(round=%d,head=%d,allocs=%d) "
+            "ring_after=(round=%d,head=%d,allocs=%d) "
+            "chunk_rounds=%s wm=(%d,%d)",
+            self.bootstrap_room, len(kv_indices), len(result),
+            *pre_alloc_state, *post_alloc_state,
+            rounds_used, *staging_allocator.get_watermark(),
+        )
+
+        return result
 
     def init(
         self,
