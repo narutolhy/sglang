@@ -24,6 +24,9 @@ class FastQueue:
                 self._cond.wait()
             return self._buf.popleft()
 
+    def qsize(self):
+        return len(self._buf)
+
 
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int32], dst_indices: npt.NDArray[np.int32]
