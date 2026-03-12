@@ -71,6 +71,8 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
+_STAGING_DEBUG = os.getenv("SGLANG_STAGING_DEBUG", "0") == "1"
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
@@ -1239,11 +1241,12 @@ class DecodeTransferQueue:
                 + "\n".join(f"  {m}" for m in mismatch_layers)
             )
         else:
-            logger.info(
-                f"[POST-SCATTER OK] rid={rid} room={room} "
-                f"prefill_tp={prefill_tp} decode_tp={decode_tp} "
-                f"tokens={num_tokens} pages={num_pages}"
-            )
+            if _STAGING_DEBUG:
+                logger.info(
+                    "[POST-SCATTER OK] rid=%s room=%s "
+                    "prefill_tp=%s decode_tp=%s tokens=%d pages=%d",
+                    rid, room, prefill_tp, decode_tp, num_tokens, num_pages,
+                )
 
     def _submit_scatter_staging(self, decode_req: DecodeRequest) -> int:
         """Submit scatter for the last chunk (triggered by KVPoll.Success).
@@ -1290,22 +1293,23 @@ class DecodeTransferQueue:
         if ctx is None:
             return
         _, staging_allocator, _, _, _, _ = ctx
-        pre_wm = staging_allocator.get_watermark()
-        num_allocs_before = len(staging_allocator.allocations)
+        if _STAGING_DEBUG:
+            _pre_wm = staging_allocator.get_watermark()
+            _num_allocs_before = len(staging_allocator.allocations)
         staging_allocator.free(alloc_id)
         post_wm = staging_allocator.get_watermark()
-        num_allocs_after = len(staging_allocator.allocations)
-        logger.info(
-            "[WM-FREE] decode_tp=%d alloc_id=%d room=%s "
-            "wm_before=(%d,%d) wm_after=(%d,%d) allocs: %d->%d order_head=%s",
-            self.tp_rank,
-            alloc_id,
-            getattr(decode_req.req, "bootstrap_room", "?"),
-            pre_wm[0], pre_wm[1],
-            post_wm[0], post_wm[1],
-            num_allocs_before, num_allocs_after,
-            staging_allocator.alloc_order[0] if staging_allocator.alloc_order else "empty",
-        )
+        if _STAGING_DEBUG:
+            logger.info(
+                "[WM-FREE] decode_tp=%d alloc_id=%d room=%s "
+                "wm_before=(%d,%d) wm_after=(%d,%d) allocs: %d->%d order_head=%s",
+                self.tp_rank,
+                alloc_id,
+                getattr(decode_req.req, "bootstrap_room", "?"),
+                _pre_wm[0], _pre_wm[1],
+                post_wm[0], post_wm[1],
+                _num_allocs_before, len(staging_allocator.allocations),
+                staging_allocator.alloc_order[0] if staging_allocator.alloc_order else "empty",
+            )
         receiver = decode_req.kv_receiver
         if (
             receiver is not None
@@ -1328,12 +1332,13 @@ class DecodeTransferQueue:
                         )
                 except Exception:
                     pass
-            logger.info(
-                "[WM-SEND] decode_tp=%d session=%s wm=(%d,%d) room=%s",
-                self.tp_rank,
-                session_id, wm_round, wm_tail,
-                getattr(decode_req.req, "bootstrap_room", "?"),
-            )
+            if _STAGING_DEBUG:
+                logger.info(
+                    "[WM-SEND] decode_tp=%d session=%s wm=(%d,%d) room=%s",
+                    self.tp_rank,
+                    session_id, wm_round, wm_tail,
+                    getattr(decode_req.req, "bootstrap_room", "?"),
+                )
         else:
             logger.warning(
                 "[WM-SEND SKIP] decode_tp=%d alloc_id=%d room=%s receiver=%s "
