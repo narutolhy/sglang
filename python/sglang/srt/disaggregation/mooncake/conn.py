@@ -1238,24 +1238,6 @@ class MooncakeKVManager(CommonKVManager):
                                 chunk_idx >= len(req.staging_offsets)
                                 or req.staging_offsets[chunk_idx] < 0
                             ):
-                                stg_key = (kv_chunk.room, chunk_idx, req.mooncake_session_id)
-                                if not hasattr(self, "_staging_requested"):
-                                    self._staging_requested = set()
-                                if stg_key not in self._staging_requested:
-                                    self._staging_requested.add(stg_key)
-                                    try:
-                                        self._connect(
-                                            format_tcp_address(req.endpoint, req.dst_port),
-                                            is_ipv6=is_valid_ipv6_address(req.endpoint),
-                                        ).send_multipart([
-                                            b"STAGING_REQ",
-                                            str(req.room).encode("ascii"),
-                                            str(chunk_idx).encode("ascii"),
-                                            str(chunk_pages).encode("ascii"),
-                                            req.mooncake_session_id.encode("ascii"),
-                                        ])
-                                    except Exception:
-                                        self._staging_requested.discard(stg_key)
                                 if _STAGING_DEBUG:
                                     kv_chunk._defer_count += queue.qsize()
                                 queue.put(kv_chunk)
@@ -1549,6 +1531,55 @@ class MooncakeKVManager(CommonKVManager):
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
+
+    def _prefetch_staging_reqs(self, room: int):
+        """Send STAGING_REQ for all chunks before the prefill forward starts.
+
+        Called from the scheduler right after batch formation, so that decode
+        allocates staging during the GPU forward pass.  This avoids the
+        round-trip latency that would otherwise block the transfer worker.
+        """
+        if not self.enable_staging:
+            return
+        kv_buf = getattr(self, "kv_buffer_tensors", None)
+        if kv_buf is None:
+            return
+        page_size = kv_buf["page_size"]
+        cps = self.server_args.chunked_prefill_size or 8192
+        full_chunk_pages = max(1, cps // page_size)
+
+        if not hasattr(self, "_staging_requested"):
+            self._staging_requested = set()
+
+        for session_id, tinfo in self.transfer_infos[room].items():
+            if tinfo.is_dummy:
+                continue
+            total_pages = len(tinfo.dst_kv_indices)
+            if total_pages == 0:
+                continue
+            num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages
+
+            for chunk_idx in range(num_chunks):
+                stg_key = (room, chunk_idx, session_id)
+                if stg_key in self._staging_requested:
+                    continue
+                self._staging_requested.add(stg_key)
+
+                remaining = total_pages - chunk_idx * full_chunk_pages
+                chunk_pages = min(full_chunk_pages, remaining)
+                try:
+                    self._connect(
+                        format_tcp_address(tinfo.endpoint, tinfo.dst_port),
+                        is_ipv6=is_valid_ipv6_address(tinfo.endpoint),
+                    ).send_multipart([
+                        b"STAGING_REQ",
+                        str(room).encode("ascii"),
+                        str(chunk_idx).encode("ascii"),
+                        str(chunk_pages).encode("ascii"),
+                        session_id.encode("ascii"),
+                    ])
+                except Exception:
+                    self._staging_requested.discard(stg_key)
 
     def start_prefill_thread(self):
         def bootstrap_thread():

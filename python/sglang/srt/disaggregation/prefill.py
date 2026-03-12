@@ -350,6 +350,19 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def _prefetch_staging_for_batch(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> None:
+        """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        prefetch = getattr(kv_mgr, "_prefetch_staging_reqs", None)
+        if prefetch is None:
+            return
+        for req in batch.reqs:
+            room = getattr(req, "bootstrap_room", None)
+            if room is not None and room in kv_mgr.transfer_infos:
+                prefetch(room)
+
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
@@ -385,6 +398,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                self._prefetch_staging_for_batch(batch)
                 result = self.run_batch(batch)
                 self.process_batch_result_disagg_prefill(batch, result)
             else:
@@ -413,6 +427,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                self._prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
