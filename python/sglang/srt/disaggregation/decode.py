@@ -370,10 +370,10 @@ class DecodePreallocQueue:
                     kv_pool.v_buffer,
                     kv_pool.page_size,
                 )
-            # Both will be set from actual prefill info in
-            # _resolve_pending_reqs after ensure_parallel_info succeeds.
-            kv_manager.prefill_attn_tp_size = 0
-            kv_manager.prefill_chunked_prefill_size = 0
+        # Both will be set from actual prefill info in
+        # _resolve_pending_reqs after ensure_parallel_info succeeds.
+        kv_manager.prefill_attn_tp_size = 0
+        kv_manager.prefill_chunked_prefill_size = 0
         self.scheduler._decode_kv_manager = kv_manager
         return kv_manager
 
@@ -1398,9 +1398,11 @@ class DecodeTransferQueue:
             remaining = []
             for chunk_idx, group in by_chunk.items():
                 if chunk_idx >= len(chunk_infos):
+                    remaining.extend(group)
                     continue
                 alloc_id, staging_offset, staging_round, _ = chunk_infos[chunk_idx]
                 if staging_offset < 0:
+                    remaining.extend(group)
                     continue
                 if len(group) < num_writers:
                     remaining.extend(group)
@@ -1523,6 +1525,12 @@ class DecodeTransferQueue:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
+                if self.staging_ctx is not None:
+                    kv_mgr = self.staging_ctx[0]
+                    room = decode_req.req.bootstrap_room
+                    pending = getattr(kv_mgr, "pending_chunk_scatters", {})
+                    if room in pending and pending[room]:
+                        continue
                 slot_id = self._submit_scatter_staging(decode_req)
                 if slot_id >= 0:
                     scatter_stream = getattr(
