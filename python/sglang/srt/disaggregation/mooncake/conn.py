@@ -983,13 +983,6 @@ class MooncakeKVManager(CommonKVManager):
         worker_id: int = 0,
     ):
         staging_strategy = None
-        if staging_buffer is not None and self.enable_staging:
-            from sglang.srt.disaggregation.common.staging_handler import (
-                PrefillStagingStrategy,
-            )
-
-            if getattr(self, "kv_buffer_tensors", None) is not None:
-                staging_strategy = PrefillStagingStrategy(self, staging_buffer)
 
         while True:
             try:
@@ -1044,6 +1037,19 @@ class MooncakeKVManager(CommonKVManager):
                             or self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         )
+                        if (
+                            staging_strategy is None
+                            and staging_buffer is not None
+                            and self.enable_staging
+                            and getattr(self, "kv_buffer_tensors", None) is not None
+                        ):
+                            from sglang.srt.disaggregation.common.staging_handler import (
+                                PrefillStagingStrategy,
+                            )
+
+                            staging_strategy = PrefillStagingStrategy(
+                                self, staging_buffer
+                            )
                         use_staging = (
                             not tp_match
                             and staging_strategy is not None
