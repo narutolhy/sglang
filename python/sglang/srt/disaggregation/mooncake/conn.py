@@ -59,56 +59,12 @@ class TransferKVChunk:
     state_indices: Optional[List[int]]
 
 
-@dataclasses.dataclass
-class StagingTransferInfo:
-    """Per-chunk staging allocation info attached to a TransferInfo."""
-
-    offsets: List[int] = dataclasses.field(default_factory=lambda: [-1])
-    rounds: List[int] = dataclasses.field(default_factory=lambda: [0])
-    ends: List[int] = dataclasses.field(default_factory=lambda: [-1])
-
-    @staticmethod
-    def _parse_csv_ints(raw: str, default: int) -> List[int]:
-        if not raw or raw == "":
-            return [default]
-        return [int(x) for x in raw.split(",")]
-
-    @classmethod
-    def from_zmq_fields(cls, msg: List[bytes]) -> Optional["StagingTransferInfo"]:
-        offsets_raw = msg[8].decode("ascii") if len(msg) > 8 and msg[8] != b"" else ""
-        rounds_raw = msg[9].decode("ascii") if len(msg) > 9 and msg[9] != b"" else ""
-        ends_raw = msg[10].decode("ascii") if len(msg) > 10 and msg[10] != b"" else ""
-        if not offsets_raw and not rounds_raw and not ends_raw:
-            return None
-        return cls(
-            offsets=cls._parse_csv_ints(offsets_raw, -1),
-            rounds=cls._parse_csv_ints(rounds_raw, 0),
-            ends=cls._parse_csv_ints(ends_raw, -1),
-        )
-
-
-@dataclasses.dataclass
-class StagingRegisterInfo:
-    """Staging buffer registration info attached to a KVArgsRegisterInfo."""
-
-    base_ptr: int = 0
-    total_size: int = 0
-
-    @classmethod
-    def from_zmq_fields(cls, msg: List[bytes]) -> Optional["StagingRegisterInfo"]:
-        base_ptr = (
-            struct.unpack("Q", msg[12])[0]
-            if len(msg) > 12 and len(msg[12]) == 8
-            else 0
-        )
-        total_size = (
-            int(msg[13].decode("ascii"))
-            if len(msg) > 13 and len(msg[13]) > 0
-            else 0
-        )
-        if base_ptr == 0 and total_size == 0:
-            return None
-        return cls(base_ptr=base_ptr, total_size=total_size)
+from sglang.srt.disaggregation.common.staging_handler import (
+    DecodeStagingState,
+    PrefillStagingState,
+    StagingRegisterInfo,
+    StagingTransferInfo,
+)
 
 
 # decode
@@ -196,27 +152,6 @@ class KVArgsRegisterInfo:
             ),
             staging=StagingRegisterInfo.from_zmq_fields(msg),
         )
-
-
-@dataclasses.dataclass
-class PrefillStagingState:
-    """Staging-specific state for prefill mode."""
-
-    buffers: list = dataclasses.field(default_factory=list)
-    remote_watermarks: dict = dataclasses.field(default_factory=dict)
-    watermark_cv: threading.Condition = dataclasses.field(
-        default_factory=threading.Condition
-    )
-
-
-@dataclasses.dataclass
-class DecodeStagingState:
-    """Staging-specific state for decode mode."""
-
-    allocator: object = None
-    pending_chunk_scatters: dict = dataclasses.field(default_factory=dict)
-    room_bootstrap: dict = dataclasses.field(default_factory=dict)
-    room_receivers: dict = dataclasses.field(default_factory=dict)
 
 
 class AuxDataCodec:
@@ -360,13 +295,13 @@ class MooncakeKVManager(CommonKVManager):
 
         handle_staging_req(
             msg,
-            self._staging.allocator if self._staging else None,
+            self._staging.allocator,
             self.kv_args,
             self.attn_tp_size,
             getattr(self, "prefill_attn_tp_size", self.attn_tp_size),
             getattr(self, "kv_buffer_tensors", None),
-            self._staging.room_receivers if self._staging else {},
-            self._staging.room_bootstrap if self._staging else {},
+            self._staging.room_receivers,
+            self._staging.room_bootstrap,
         )
 
     def _is_watermark_ready(
@@ -377,6 +312,97 @@ class MooncakeKVManager(CommonKVManager):
         )
 
         return is_watermark_ready(self._staging, session_id, alloc_round, alloc_end)
+
+    def _try_create_staging_strategy(self, staging_buffer):
+        if not self.enable_staging:
+            return None
+        if getattr(self, "kv_buffer_tensors", None) is None:
+            return None
+        from sglang.srt.disaggregation.common.staging_handler import (
+            PrefillStagingStrategy,
+        )
+
+        return PrefillStagingStrategy(self, staging_buffer)
+
+    def _send_chunk_ready(self, req, chunk_idx, kv_chunk, local_rank):
+        """Notify decode that a non-last staging chunk RDMA is complete."""
+        try:
+            self._connect(
+                format_tcp_address(req.endpoint, req.dst_port),
+                is_ipv6=is_valid_ipv6_address(req.endpoint),
+            ).send_multipart(
+                [
+                    b"CHUNK_READY",
+                    str(req.room).encode("ascii"),
+                    str(chunk_idx).encode("ascii"),
+                    str(kv_chunk.index_slice.start).encode("ascii"),
+                    str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+                    req.mooncake_session_id.encode("ascii"),
+                    str(local_rank).encode("ascii"),
+                ]
+            )
+        except Exception:
+            pass
+
+    def _do_staging_transfer(self, staging_strategy, kv_chunk, req,
+                             target_info, chunked_dst_kv_indice, executor, queue):
+        """Execute staging transfer for one chunk. Returns (ret, chunk_idx, deferred).
+
+        deferred=True means caller should re-enqueue and break.
+        """
+        ready, chunk_idx, c_offset, c_round, c_end = staging_strategy.check_ready(
+            req, kv_chunk.index_slice.start, len(kv_chunk.prefill_kv_indices),
+        )
+        if not ready:
+            queue.put(kv_chunk)
+            return (-1, chunk_idx, True)
+
+        ret = staging_strategy.transfer(
+            req.mooncake_session_id,
+            kv_chunk.prefill_kv_indices,
+            target_info.staging.base_ptr + c_offset,
+            target_info.staging.total_size - c_offset,
+            target_info,
+        )
+        if ret == -1:
+            logger.warning(
+                f"[Staging] Falling back to per-token slice path (room={kv_chunk.room})"
+            )
+            ret = self.send_kvcache_slice(
+                req.mooncake_session_id,
+                kv_chunk.prefill_kv_indices,
+                target_info.dst_kv_ptrs,
+                chunked_dst_kv_indice,
+                target_info.dst_tp_rank,
+                target_info.dst_attn_tp_size,
+                target_info.dst_kv_item_len,
+                executor,
+            )
+        return (ret, chunk_idx, False)
+
+    def _prefetch_staging_reqs(self, room: int):
+        if not self.enable_staging:
+            return
+        kv_buf = getattr(self, "kv_buffer_tensors", None)
+        if kv_buf is None:
+            return
+        if not hasattr(self, "_staging_requested"):
+            self._staging_requested = set()
+        if not hasattr(self, "_prefetch_sockets"):
+            self._prefetch_sockets = {}
+
+        from sglang.srt.disaggregation.common.staging_handler import (
+            prefetch_staging_reqs,
+        )
+
+        prefetch_staging_reqs(
+            room,
+            self.transfer_infos,
+            kv_buf,
+            self.server_args.chunked_prefill_size,
+            self._staging_requested,
+            self._prefetch_sockets,
+        )
 
     def send_kvcache_staged(
         self,
@@ -1071,18 +1097,9 @@ class MooncakeKVManager(CommonKVManager):
                             or self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         )
-                        if (
-                            staging_strategy is None
-                            and staging_buffer is not None
-                            and self.enable_staging
-                            and getattr(self, "kv_buffer_tensors", None) is not None
-                        ):
-                            from sglang.srt.disaggregation.common.staging_handler import (
-                                PrefillStagingStrategy,
-                            )
-
-                            staging_strategy = PrefillStagingStrategy(
-                                self, staging_buffer
+                        if staging_strategy is None and staging_buffer is not None:
+                            staging_strategy = self._try_create_staging_strategy(
+                                staging_buffer
                             )
                         use_staging = (
                             not tp_match
@@ -1103,40 +1120,14 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                             )
                         elif use_staging:
-                            ready, chunk_idx, c_offset, c_round, c_end = (
-                                staging_strategy.check_ready(
-                                    req,
-                                    kv_chunk.index_slice.start,
-                                    len(kv_chunk.prefill_kv_indices),
-                                )
+                            ret, chunk_idx, deferred = self._do_staging_transfer(
+                                staging_strategy, kv_chunk, req,
+                                target_rank_registration_info,
+                                chunked_dst_kv_indice, executor, queue,
                             )
-                            if not ready:
-                                queue.put(kv_chunk)
+                            if deferred:
                                 watermark_deferred = True
                                 break
-
-                            ret = staging_strategy.transfer(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.staging.base_ptr + c_offset,
-                                target_rank_registration_info.staging.total_size - c_offset,
-                                target_rank_registration_info,
-                            )
-                            if ret == -1:
-                                logger.warning(
-                                    f"[Staging] Falling back to per-token slice path "
-                                    f"(room={kv_chunk.room})"
-                                )
-                                ret = self.send_kvcache_slice(
-                                    req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
-                                    target_rank_registration_info.dst_kv_ptrs,
-                                    chunked_dst_kv_indice,
-                                    target_rank_registration_info.dst_tp_rank,
-                                    target_rank_registration_info.dst_attn_tp_size,
-                                    target_rank_registration_info.dst_kv_item_len,
-                                    executor,
-                                )
                         else:
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
@@ -1172,25 +1163,9 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if use_staging and not kv_chunk.is_last and ret == 0:
-                            try:
-                                self._connect(
-                                    format_tcp_address(req.endpoint, req.dst_port),
-                                    is_ipv6=is_valid_ipv6_address(req.endpoint),
-                                ).send_multipart(
-                                    [
-                                        b"CHUNK_READY",
-                                        str(req.room).encode("ascii"),
-                                        str(chunk_idx).encode("ascii"),
-                                        str(kv_chunk.index_slice.start).encode("ascii"),
-                                        str(len(kv_chunk.prefill_kv_indices)).encode(
-                                            "ascii"
-                                        ),
-                                        req.mooncake_session_id.encode("ascii"),
-                                        str(local_rank).encode("ascii"),
-                                    ]
-                                )
-                            except Exception:
-                                pass
+                            self._send_chunk_ready(
+                                req, chunk_idx, kv_chunk, local_rank
+                            )
 
                         if kv_chunk.is_last:
                             if kv_chunk.state_indices is not None:
@@ -1202,6 +1177,7 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info,
                                 )
 
+                            # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
                                 req,
                                 kv_chunk.prefill_aux_index,
@@ -1212,6 +1188,7 @@ class MooncakeKVManager(CommonKVManager):
                                 (req.endpoint, req.dst_port, req.room)
                             )
 
+                            # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.update_status(req.room, status)
@@ -1248,30 +1225,6 @@ class MooncakeKVManager(CommonKVManager):
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
 
-    def _prefetch_staging_reqs(self, room: int):
-        if not self.enable_staging:
-            return
-        kv_buf = getattr(self, "kv_buffer_tensors", None)
-        if kv_buf is None:
-            return
-        if not hasattr(self, "_staging_requested"):
-            self._staging_requested = set()
-        if not hasattr(self, "_prefetch_sockets"):
-            self._prefetch_sockets = {}
-
-        from sglang.srt.disaggregation.common.staging_handler import (
-            prefetch_staging_reqs,
-        )
-
-        prefetch_staging_reqs(
-            room,
-            self.transfer_infos,
-            kv_buf,
-            self.server_args.chunked_prefill_size,
-            self._staging_requested,
-            self._prefetch_sockets,
-        )
-
     def start_prefill_thread(self):
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
@@ -1289,22 +1242,7 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     with self._staging.watermark_cv:
                         prev = self._staging.remote_watermarks.get(wm_session, (0, 0))
-                        is_regression = (wm_round < prev[0]) or (
-                            wm_round == prev[0] and wm_tail < prev[1]
-                        )
-                        if is_regression:
-                            logger.warning(
-                                "[WM-RECV-REGRESS] prefill_tp=%d prefill_dp=%d "
-                                "session=%s new=(%d,%d) prev=(%d,%d) ignored=True",
-                                self.attn_tp_rank,
-                                self.attn_dp_rank,
-                                wm_session,
-                                wm_round,
-                                wm_tail,
-                                prev[0],
-                                prev[1],
-                            )
-                        else:
+                        if (wm_round, wm_tail) > prev:
                             self._staging.remote_watermarks[wm_session] = (
                                 wm_round,
                                 wm_tail,
@@ -1323,14 +1261,9 @@ class MooncakeKVManager(CommonKVManager):
                     if tinfo is not None:
                         if tinfo.staging is None:
                             tinfo.staging = StagingTransferInfo()
-                        stg = tinfo.staging
-                        while len(stg.offsets) <= stg_chunk_idx:
-                            stg.offsets.append(-1)
-                            stg.rounds.append(0)
-                            stg.ends.append(-1)
-                        stg.offsets[stg_chunk_idx] = stg_offset
-                        stg.rounds[stg_chunk_idx] = stg_round
-                        stg.ends[stg_chunk_idx] = stg_end
+                        tinfo.staging.set_chunk(
+                            stg_chunk_idx, stg_offset, stg_round, stg_end
+                        )
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
@@ -1689,7 +1622,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_kv_item_len = str(kv_item_len).encode("ascii")
 
             _stg = getattr(self.kv_mgr, "_staging", None)
-            _alloc = getattr(_stg, "allocator", None) if _stg else None
+            _alloc = _stg.allocator if _stg else None
             if _alloc is not None:
                 packed_staging_base_ptr = struct.pack("Q", _alloc.get_base_ptr())
                 staging_total_size_str = str(_alloc.get_total_size()).encode("ascii")
@@ -1740,7 +1673,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             return
 
         _stg = getattr(self.kv_mgr, "_staging", None)
-        if _stg is not None and getattr(_stg, "allocator", None) is not None:
+        if _stg is not None and _stg.allocator is not None:
             self.chunk_staging_infos = []
             self.kv_mgr.register_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
@@ -1748,21 +1681,15 @@ class MooncakeKVReceiver(CommonKVReceiver):
         else:
             self.chunk_staging_infos = self._allocate_chunk_staging(kv_indices)
 
-        offsets_str = (
-            ",".join(str(info[1]) for info in self.chunk_staging_infos)
-            if self.chunk_staging_infos
-            else "-1"
-        )
-        rounds_str = (
-            ",".join(str(info[2]) for info in self.chunk_staging_infos)
-            if self.chunk_staging_infos
-            else "0"
-        )
-        ends_str = (
-            ",".join(str(info[3]) for info in self.chunk_staging_infos)
-            if self.chunk_staging_infos
-            else "-1"
-        )
+        if self.chunk_staging_infos:
+            stg_info = StagingTransferInfo(
+                offsets=[i[1] for i in self.chunk_staging_infos],
+                rounds=[i[2] for i in self.chunk_staging_infos],
+                ends=[i[3] for i in self.chunk_staging_infos],
+            )
+        else:
+            stg_info = StagingTransferInfo()
+        stg_fields = stg_info.to_zmq_fields()
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -1786,9 +1713,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             else b""
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
-                        offsets_str.encode("ascii"),
-                        rounds_str.encode("ascii"),
-                        ends_str.encode("ascii"),
+                        *stg_fields,
                     ]
                 )
         self.init_time = time.time()

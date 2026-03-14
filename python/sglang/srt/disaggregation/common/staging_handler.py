@@ -3,15 +3,23 @@ Staging handler for heterogeneous TP KV cache transfer.
 
 This module isolates the staging scatter lifecycle management from the core
 decode and prefill transfer logic, reducing invasiveness in decode.py and
-conn.py.  Two main classes:
+conn.py.
 
+Contents:
+- Data classes: StagingTransferInfo, StagingRegisterInfo, PrefillStagingState,
+  DecodeStagingState
 - DecodeStagingHandler: decode-side scatter state machine
 - PrefillStagingStrategy: prefill-side staging transfer decision + execution
+- Utility functions: init_staging_buffers, init_staging_allocator,
+  handle_staging_req, allocate_chunk_staging_for_receiver, etc.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import struct
+import threading
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -21,6 +29,105 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
+
+
+# ======================================================================
+# Data classes for staging protocol
+# ======================================================================
+
+
+@dataclasses.dataclass
+class StagingTransferInfo:
+    """Per-chunk staging allocation info attached to a TransferInfo."""
+
+    offsets: List[int] = dataclasses.field(default_factory=lambda: [-1])
+    rounds: List[int] = dataclasses.field(default_factory=lambda: [0])
+    ends: List[int] = dataclasses.field(default_factory=lambda: [-1])
+
+    @staticmethod
+    def _parse_csv_ints(raw: str, default: int) -> List[int]:
+        if not raw or raw == "":
+            return [default]
+        return [int(x) for x in raw.split(",")]
+
+    def set_chunk(self, idx: int, offset: int, rnd: int, end: int):
+        while len(self.offsets) <= idx:
+            self.offsets.append(-1)
+            self.rounds.append(0)
+            self.ends.append(-1)
+        self.offsets[idx] = offset
+        self.rounds[idx] = rnd
+        self.ends[idx] = end
+
+    def to_zmq_fields(self) -> Tuple[bytes, bytes, bytes]:
+        return (
+            ",".join(str(x) for x in self.offsets).encode("ascii"),
+            ",".join(str(x) for x in self.rounds).encode("ascii"),
+            ",".join(str(x) for x in self.ends).encode("ascii"),
+        )
+
+    @classmethod
+    def from_zmq_fields(cls, msg: list) -> Optional["StagingTransferInfo"]:
+        offsets_raw = msg[8].decode("ascii") if len(msg) > 8 and msg[8] != b"" else ""
+        rounds_raw = msg[9].decode("ascii") if len(msg) > 9 and msg[9] != b"" else ""
+        ends_raw = msg[10].decode("ascii") if len(msg) > 10 and msg[10] != b"" else ""
+        if not offsets_raw and not rounds_raw and not ends_raw:
+            return None
+        return cls(
+            offsets=cls._parse_csv_ints(offsets_raw, -1),
+            rounds=cls._parse_csv_ints(rounds_raw, 0),
+            ends=cls._parse_csv_ints(ends_raw, -1),
+        )
+
+
+@dataclasses.dataclass
+class StagingRegisterInfo:
+    """Staging buffer registration info attached to a KVArgsRegisterInfo."""
+
+    base_ptr: int = 0
+    total_size: int = 0
+
+    @classmethod
+    def from_zmq_fields(cls, msg: list) -> Optional["StagingRegisterInfo"]:
+        base_ptr = (
+            struct.unpack("Q", msg[12])[0]
+            if len(msg) > 12 and len(msg[12]) == 8
+            else 0
+        )
+        total_size = (
+            int(msg[13].decode("ascii"))
+            if len(msg) > 13 and len(msg[13]) > 0
+            else 0
+        )
+        if base_ptr == 0 and total_size == 0:
+            return None
+        return cls(base_ptr=base_ptr, total_size=total_size)
+
+
+@dataclasses.dataclass
+class PrefillStagingState:
+    """Staging-specific state for prefill mode."""
+
+    buffers: list = dataclasses.field(default_factory=list)
+    remote_watermarks: dict = dataclasses.field(default_factory=dict)
+    watermark_cv: threading.Condition = dataclasses.field(
+        default_factory=threading.Condition
+    )
+
+
+@dataclasses.dataclass
+class DecodeStagingState:
+    """Staging-specific state for decode mode."""
+
+    allocator: object = None
+    pending_chunk_scatters: dict = dataclasses.field(default_factory=dict)
+    room_bootstrap: dict = dataclasses.field(default_factory=dict)
+    room_receivers: dict = dataclasses.field(default_factory=dict)
+
+
+# ======================================================================
+# Decode-side staging scatter handler
+# ======================================================================
 
 
 class DecodeStagingHandler:
