@@ -282,19 +282,12 @@ class DecodePreallocQueue:
         kv_args = kv_args_class()
 
         attn_tp_size = get_attention_tp_size()
-        kv_args.engine_rank = self.tp_rank
+        kv_args.engine_rank = self.tp_rank % (attn_tp_size)
 
         kv_args.decode_tp_size = attn_tp_size
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.prefill_pp_size = self.prefill_pp_size
-        kv_pool_for_heads = self.token_to_kv_pool
-        if hasattr(kv_pool_for_heads, "full_kv_pool"):
-            kv_pool_for_heads = kv_pool_for_heads.full_kv_pool
-        per_rank_kv_heads = getattr(kv_pool_for_heads, "head_num", 0)
-        if per_rank_kv_heads > 0:
-            kv_args.kv_head_num = per_rank_kv_heads
-            kv_args.total_kv_head_num = per_rank_kv_heads * attn_tp_size
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -353,27 +346,24 @@ class DecodePreallocQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
-        # Pass KV pool tensor refs for staging buffer scatter on decode side
-        if (
-            hasattr(kv_manager, "enable_staging")
-            and kv_manager.enable_staging
-            and hasattr(kv_manager, "set_kv_buffer_tensors")
-            and not self.is_mla_backend
-        ):
-            kv_pool = self.token_to_kv_pool
-            if hasattr(kv_pool, "full_kv_pool"):
-                kv_pool = kv_pool.full_kv_pool
-            if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
-                kv_manager.set_kv_buffer_tensors(
-                    kv_pool.k_buffer,
-                    kv_pool.v_buffer,
-                    kv_pool.page_size,
-                )
-        # Both will be set from actual prefill info in
-        # _resolve_pending_reqs after ensure_parallel_info succeeds.
-        kv_manager.prefill_attn_tp_size = 0
-        kv_manager.prefill_chunked_prefill_size = 0
-        self.scheduler._decode_kv_manager = kv_manager
+        # Staging buffer setup (only when heterogeneous TP staging is enabled)
+        if getattr(kv_manager, "enable_staging", False) and not self.is_mla_backend:
+            kv_pool_for_heads = self.token_to_kv_pool
+            if hasattr(kv_pool_for_heads, "full_kv_pool"):
+                kv_pool_for_heads = kv_pool_for_heads.full_kv_pool
+            per_rank_kv_heads = getattr(kv_pool_for_heads, "head_num", 0)
+            if per_rank_kv_heads > 0:
+                kv_args.kv_head_num = per_rank_kv_heads
+                kv_args.total_kv_head_num = per_rank_kv_heads * attn_tp_size
+            if hasattr(kv_manager, "set_kv_buffer_tensors"):
+                kv_pool = kv_pool_for_heads
+                if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
+                    kv_manager.set_kv_buffer_tensors(
+                        kv_pool.k_buffer, kv_pool.v_buffer, kv_pool.page_size
+                    )
+            kv_manager.prefill_attn_tp_size = 0
+            kv_manager.prefill_chunked_prefill_size = 0
+            self.scheduler._decode_kv_manager = kv_manager
         return kv_manager
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
@@ -539,7 +529,7 @@ class DecodePreallocQueue:
         if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
             return
 
-        if self.kv_manager.prefill_attn_tp_size == 0:
+        if getattr(self.kv_manager, "prefill_attn_tp_size", None) == 0:
             prefill_info = self.kv_manager.prefill_info_table.get(bootstrap_addr)
             if prefill_info is not None:
                 self.kv_manager.prefill_attn_tp_size = prefill_info.attn_tp_size
@@ -871,8 +861,7 @@ class DecodeTransferQueue:
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
 
-        # Validate bootstrap_room to detect context corruption.
-        # Apply same int64 mask as set_buf() for consistent comparison.
+        # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()
         raw_room = (
             decode_req.req.bootstrap_room
@@ -993,6 +982,7 @@ class DecodeTransferQueue:
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
+                # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
                 if self.scheduler.enable_metrics:
@@ -1002,6 +992,7 @@ class DecodeTransferQueue:
                 should_remove = self._commit_transfer_to_req(decode_req)
                 if should_remove:
                     indices_to_remove.add(i)
+                    # Check if request was aborted due to corruption
                     if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                         self.scheduler.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
