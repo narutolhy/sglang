@@ -109,6 +109,8 @@ class PrefillStagingState:
     watermark_cv: threading.Condition = dataclasses.field(
         default_factory=threading.Condition
     )
+    prefetch_requested: set = dataclasses.field(default_factory=set)
+    prefetch_sockets: dict = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -199,13 +201,13 @@ class DecodeStagingHandler:
         """Return True if staging scatter is complete for this request."""
         return getattr(decode_req, "_staging_scatter_done", False)
 
-    def try_advance(self, decode_req: "DecodeRequest", queue: list) -> None:
-        """Advance LAST-SCATTER state machine for a single request.
+    def advance_scatter(self, decode_req: "DecodeRequest", queue: list) -> None:
+        """Advance scatter state machine for one request after KVPoll.Success.
 
         Progresses through:
           1. Drain pending chunk scatters
-          2. Submit LAST-SCATTER to scatter_stream (async)
-          3. Check event.query() -> if done, free watermark and mark done
+          2. Submit last-chunk scatter to scatter_stream (async)
+          3. Check event completion -> free staging allocation and send watermark
         """
         room = decode_req.req.bootstrap_room
         _stg = getattr(self.kv_manager, "_staging", None)
