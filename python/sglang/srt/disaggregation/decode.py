@@ -285,7 +285,7 @@ class DecodePreallocQueue:
         kv_args = kv_args_class()
 
         attn_tp_size = get_attention_tp_size()
-        kv_args.engine_rank = self.tp_rank % (attn_tp_size)
+        kv_args.engine_rank = self.tp_rank
 
         kv_args.decode_tp_size = attn_tp_size
         kv_args.pp_rank = self.pp_rank
@@ -1254,17 +1254,44 @@ class DecodeTransferQueue:
         Returns the alloc_id (>= 0) if scatter was submitted, or -1.
         """
         if self.staging_ctx is None:
+            if _STAGING_DEBUG:
+                logger.warning(
+                    "[LAST-SCATTER-SKIP] decode_tp=%d rid=%s room=%s reason=no_staging_ctx",
+                    self.tp_rank,
+                    decode_req.req.rid,
+                    decode_req.req.bootstrap_room,
+                )
             return -1
 
         kv_manager = self.staging_ctx[0]
         receiver = decode_req.kv_receiver
         chunk_infos = getattr(receiver, "chunk_staging_infos", [])
         if not chunk_infos:
+            if _STAGING_DEBUG:
+                logger.warning(
+                    "[LAST-SCATTER-SKIP] decode_tp=%d rid=%s room=%s session=%s reason=empty_chunk_infos",
+                    self.tp_rank,
+                    decode_req.req.rid,
+                    decode_req.req.bootstrap_room,
+                    getattr(receiver, "session_id", ""),
+                )
             return -1
 
         last_info = chunk_infos[-1]
         alloc_id, staging_offset, _, _ = last_info
         if staging_offset < 0 or alloc_id < 0:
+            if _STAGING_DEBUG:
+                logger.warning(
+                    "[LAST-SCATTER-SKIP] decode_tp=%d rid=%s room=%s session=%s "
+                    "reason=invalid_last_info alloc_id=%d staging_offset=%d chunk_infos=%s",
+                    self.tp_rank,
+                    decode_req.req.rid,
+                    decode_req.req.bootstrap_room,
+                    getattr(receiver, "session_id", ""),
+                    alloc_id,
+                    staging_offset,
+                    chunk_infos,
+                )
             return -1
 
         seq_len = len(decode_req.req.origin_input_ids)
@@ -1282,9 +1309,37 @@ class DecodeTransferQueue:
         page_start = chunk_pages * (n - 1)
         last_num_pages = total_pages - page_start
 
+        if _STAGING_DEBUG:
+            logger.info(
+                "[LAST-SCATTER-SUBMIT] decode_tp=%d rid=%s room=%s session=%s "
+                "alloc_id=%d staging_offset=%d total_pages=%d num_chunks=%d "
+                "chunk_pages=%d page_start=%d last_num_pages=%d",
+                self.tp_rank,
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+                getattr(receiver, "session_id", ""),
+                alloc_id,
+                staging_offset,
+                total_pages,
+                n,
+                chunk_pages,
+                page_start,
+                last_num_pages,
+            )
         ok = self._scatter_staging_region(
             staging_offset, page_start, last_num_pages, decode_req
         )
+        if _STAGING_DEBUG:
+            logger.info(
+                "[LAST-SCATTER-RESULT] decode_tp=%d rid=%s room=%s session=%s "
+                "alloc_id=%d ok=%s",
+                self.tp_rank,
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+                getattr(receiver, "session_id", ""),
+                alloc_id,
+                ok,
+            )
         return alloc_id if ok else -1
 
     def _free_and_send_watermark(self, alloc_id: int, decode_req: DecodeRequest):
@@ -1384,7 +1439,6 @@ class DecodeTransferQueue:
             if dr.req.bootstrap_room in pending
         }
 
-        processed_rooms = []
         for room, chunks in list(pending.items()):
             decode_req = room_to_req.get(room)
             if decode_req is None:
@@ -1400,17 +1454,14 @@ class DecodeTransferQueue:
             for chunk in chunks:
                 by_chunk[chunk[0]].append(chunk)
 
-            remaining = []
+            scattered_chunks = set()
             for chunk_idx, group in by_chunk.items():
                 if chunk_idx >= len(chunk_infos):
-                    remaining.extend(group)
                     continue
                 alloc_id, staging_offset, staging_round, _ = chunk_infos[chunk_idx]
                 if staging_offset < 0:
-                    remaining.extend(group)
                     continue
                 if len(group) < num_writers:
-                    remaining.extend(group)
                     continue
 
                 page_start = group[0][1]
@@ -1425,14 +1476,10 @@ class DecodeTransferQueue:
                         event.record(scatter_stream)
                     decode_req._chunk_events.append((event, alloc_id))
                     chunk_infos[chunk_idx] = (-1, -1, 0, -1)
+                    scattered_chunks.add(chunk_idx)
 
-            if remaining:
-                pending[room] = remaining
-            else:
-                processed_rooms.append(room)
-
-        for room in processed_rooms:
-            pending.pop(room, None)
+            if scattered_chunks:
+                chunks[:] = [c for c in chunks if c[0] not in scattered_chunks]
 
         for decode_req in self.queue:
             chunk_events = getattr(decode_req, "_chunk_events", None)
@@ -1474,9 +1521,111 @@ class DecodeTransferQueue:
             transferred_reqs.append(decode_req.req)
         return True
 
+    def _advance_last_scatter(self, decode_req: DecodeRequest):
+        """Advance LAST-SCATTER state machine for a single request.
+
+        Called each poll when KVPoll.Success is detected.  Progresses through:
+          1. Drain pending chunk scatters (while loop)
+          2. Submit LAST-SCATTER to scatter_stream (async, non-blocking)
+          3. Check event.query() → if done, free watermark and mark done
+
+        Sets decode_req._staging_scatter_done = True when fully complete.
+        No blocking synchronize — uses event.query() for non-blocking check.
+        Commit is deferred to the poll_and_all_reduce-gated Phase 4.
+        """
+        if self.staging_ctx is None:
+            decode_req._staging_scatter_done = True
+            return
+
+        # Step 1: drain pending chunk scatters for this room.
+        # KVPoll.Success guarantees all prefill RDMA writes are done,
+        # so CHUNK_READY messages will arrive shortly from decode_thread.
+        kv_mgr = self.staging_ctx[0]
+        room = decode_req.req.bootstrap_room
+        pending = getattr(kv_mgr, "pending_chunk_scatters", {})
+
+        if room in pending and pending[room]:
+            self._process_pending_chunk_scatters()
+            if room in pending and pending[room]:
+                return
+
+        # Step 2: submit LAST-SCATTER if not yet submitted.
+        if not getattr(decode_req, "_staging_last_scatter_submitted", False):
+            if _STAGING_DEBUG:
+                logger.info(
+                    "[LAST-SCATTER-TRIGGER] decode_tp=%d rid=%s room=%s "
+                    "poll=Success session=%s",
+                    self.tp_rank,
+                    decode_req.req.rid,
+                    room,
+                    getattr(decode_req.kv_receiver, "session_id", ""),
+                )
+            slot_id = self._submit_scatter_staging(decode_req)
+            if slot_id >= 0:
+                scatter_stream = getattr(
+                    self.staging_ctx[1], "_scatter_stream", None
+                )
+                event = torch.cuda.Event()
+                if scatter_stream is not None:
+                    event.record(scatter_stream)
+                decode_req._scatter_event = event
+                decode_req._scatter_alloc_id = slot_id
+                decode_req._staging_last_scatter_submitted = True
+                if _STAGING_DEBUG:
+                    logger.info(
+                        "[LAST-SCATTER-SUBMITTED] decode_tp=%d rid=%s room=%s "
+                        "alloc_id=%d",
+                        self.tp_rank,
+                        decode_req.req.rid,
+                        room,
+                        slot_id,
+                    )
+            else:
+                if _STAGING_DEBUG:
+                    logger.warning(
+                        "[LAST-SCATTER-MISS] decode_tp=%d rid=%s room=%s "
+                        "submit_returned=-1",
+                        self.tp_rank,
+                        decode_req.req.rid,
+                        room,
+                    )
+                decode_req._staging_scatter_done = True
+            return
+
+        # Step 3: check if LAST-SCATTER event completed (non-blocking).
+        event = getattr(decode_req, "_scatter_event", None)
+        if event is not None and event.query():
+            self._free_and_send_watermark(
+                decode_req._scatter_alloc_id, decode_req
+            )
+            decode_req._scatter_event = None
+            decode_req._scatter_alloc_id = -1
+            decode_req._staging_scatter_done = True
+            if _STAGING_DEBUG:
+                logger.info(
+                    "[LAST-SCATTER-DONE] decode_tp=%d rid=%s room=%s",
+                    self.tp_rank,
+                    decode_req.req.rid,
+                    room,
+                )
+
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         self._process_pending_chunk_scatters()
 
+        # --- Phase 1: advance LAST-SCATTER state for requests that
+        # reached KVPoll.Success.  Each rank progresses independently
+        # (drain pending chunks → submit scatter → check event).
+        # No blocking — uses event.query() for non-blocking completion
+        # check.  The actual commit is gated by poll_and_all_reduce in
+        # Phase 4, ensuring all TP ranks commit together.
+        if self.staging_ctx is not None:
+            for decode_req in self.queue:
+                if not getattr(decode_req, "_staging_scatter_done", False):
+                    raw_poll = decode_req.kv_receiver.poll()
+                    if raw_poll == KVPoll.Success:
+                        self._advance_last_scatter(decode_req)
+
+        # --- Phase 2: guard check — ensure all TP ranks have same queue size
         n = len(self.queue)
         guard = torch.tensor(
             [1 if self.queue else 0, n, -n],
@@ -1486,27 +1635,27 @@ class DecodeTransferQueue:
         dist.all_reduce(guard, op=dist.ReduceOp.MIN, group=self.gloo_group)
         if guard[0].item() == 0 or guard[1].item() != -guard[2].item():
             return []
-        polls = poll_and_all_reduce(
-            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
-        )
 
+        # --- Phase 3: poll_and_all_reduce with adjusted polls.
+        # For staging requests, demote Success → Transferring until the
+        # local scatter is done.  all_reduce(MIN) ensures commit only
+        # happens when ALL TP ranks have completed their scatter.
+        raw_polls = [int(dr.kv_receiver.poll()) for dr in self.queue]
+        if self.staging_ctx is not None:
+            for i, decode_req in enumerate(self.queue):
+                if raw_polls[i] == int(KVPoll.Success):
+                    if not getattr(decode_req, "_staging_scatter_done", False):
+                        raw_polls[i] = int(KVPoll.Transferring)
+        poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
+        dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=self.gloo_group)
+        polls = poll_tensor.tolist()
+
+        # --- Phase 4: process poll results.  commit only when
+        # all_reduce confirms all TP ranks are ready.
         transferred_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
-                continue
-
-            pending_event = getattr(decode_req, "_scatter_event", None)
-            if pending_event is not None:
-                if not pending_event.query():
-                    continue  # Scatter still running on GPU, check next iteration.
-                self._complete_async_scatter(decode_req)
-                self._try_commit_and_finalize(
-                    decode_req,
-                    indices_to_remove,
-                    transferred_reqs,
-                    i,
-                )
                 continue
 
             if poll == KVPoll.Failed:
@@ -1530,23 +1679,6 @@ class DecodeTransferQueue:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-                if self.staging_ctx is not None:
-                    kv_mgr = self.staging_ctx[0]
-                    room = decode_req.req.bootstrap_room
-                    pending = getattr(kv_mgr, "pending_chunk_scatters", {})
-                    if room in pending and pending[room]:
-                        continue
-                slot_id = self._submit_scatter_staging(decode_req)
-                if slot_id >= 0:
-                    scatter_stream = getattr(
-                        self.staging_ctx[1], "_scatter_stream", None
-                    )
-                    event = torch.cuda.Event()
-                    if scatter_stream is not None:
-                        event.record(scatter_stream)
-                    decode_req._scatter_event = event
-                    decode_req._scatter_alloc_id = slot_id
-                    continue
                 self._try_commit_and_finalize(
                     decode_req,
                     indices_to_remove,

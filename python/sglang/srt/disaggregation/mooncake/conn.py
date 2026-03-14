@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -507,6 +508,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
         staging_buffer=None,
+        _timing: dict | None = None,
     ) -> int:
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         from sglang.srt.disaggregation.common.staging import (
@@ -579,6 +581,9 @@ class MooncakeKVManager(CommonKVManager):
             page_size,
             self.kv_args.gpu_id,
         )
+
+        if _timing is not None:
+            _timing["after_gather"] = time.time()
 
         dst_write_ptr = dst_staging_ptr + rank_offset
         ret = self._transfer_data(
@@ -1083,7 +1088,10 @@ class MooncakeKVManager(CommonKVManager):
                 # Each prefill sends all its dims to the appropriate offset in decode
                 src_dim_start = 0
                 num_dims_to_send = src_dim
-                dst_dim_start = local_tp_rank_in_group * src_dim
+                # TODO(yangminl): verify this logic
+                writers_per_decode = self.attn_tp_size // dst_attn_tp_size
+                local_writer_idx = local_tp_rank_in_group % writers_per_decode
+                dst_dim_start = local_writer_idx * src_dim
             else:
                 # 1 prefill rank sends to multiple decode ranks
                 # Prefill sends a slice of its dims to each decode rank
@@ -1315,6 +1323,7 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info.dst_attn_tp_size,
                                     target_rank_registration_info.dst_kv_item_len,
                                     staging_buffer=staging_buffer,
+                                    _timing=_t if _STAGING_DEBUG else None,
                                 )
                             except Exception as staging_err:
                                 raise RuntimeError(
@@ -1469,7 +1478,31 @@ class MooncakeKVManager(CommonKVManager):
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.update_status(req.room, status)
+                                if _STAGING_DEBUG:
+                                    logger.info(
+                                        "[STATUS-SEND] prefill_tp=%d room=%s session=%s "
+                                        "status=%s local_rank=%d polls=%s required=%d",
+                                        self.attn_tp_rank,
+                                        req.room,
+                                        req.mooncake_session_id,
+                                        "Success" if status == KVPoll.Success else "Failed",
+                                        local_rank,
+                                        polls,
+                                        req.required_dst_info_num,
+                                    )
                                 for endpoint, dst_port, room in dst_ranks_infos:
+                                    if _STAGING_DEBUG:
+                                        logger.info(
+                                            "[STATUS-SEND] prefill_tp=%d room=%s session=%s "
+                                            "-> decode=%s:%d status=%s prefill_rank=%d",
+                                            self.attn_tp_rank,
+                                            room,
+                                            req.mooncake_session_id,
+                                            endpoint,
+                                            dst_port,
+                                            "Success" if status == KVPoll.Success else "Failed",
+                                            local_rank,
+                                        )
                                     self.sync_status_to_decode_endpoint(
                                         endpoint, dst_port, room, status, local_rank
                                     )
@@ -1519,7 +1552,8 @@ class MooncakeKVManager(CommonKVManager):
                             f"total={_total_ms:.1f}ms "
                             f"get={_ms('loop_start','after_get'):.1f} "
                             f"prep={_ms('after_get','before_rdma'):.1f} "
-                            f"rdma={_ms('before_rdma','after_rdma'):.1f} "
+                            f"gather={_ms('before_rdma','after_gather'):.1f} "
+                            f"rdma={_ms('after_gather','after_rdma'):.1f} "
                             f"extra={_ms('before_extra','after_extra'):.1f} "
                             f"aux={_ms('after_extra','after_aux'):.1f} "
                             f"status={_ms('after_aux','after_status'):.1f} "
@@ -1550,6 +1584,8 @@ class MooncakeKVManager(CommonKVManager):
 
         if not hasattr(self, "_staging_requested"):
             self._staging_requested = set()
+        if not hasattr(self, "_prefetch_sockets"):
+            self._prefetch_sockets = {}
 
         for session_id, tinfo in self.transfer_infos[room].items():
             if tinfo.is_dummy:
@@ -1568,10 +1604,14 @@ class MooncakeKVManager(CommonKVManager):
                 remaining = total_pages - chunk_idx * full_chunk_pages
                 chunk_pages = min(full_chunk_pages, remaining)
                 try:
-                    self._connect(
-                        format_tcp_address(tinfo.endpoint, tinfo.dst_port),
-                        is_ipv6=is_valid_ipv6_address(tinfo.endpoint),
-                    ).send_multipart([
+                    ep = format_tcp_address(tinfo.endpoint, tinfo.dst_port)
+                    if ep not in self._prefetch_sockets:
+                        sock = zmq.Context().socket(zmq.PUSH)
+                        if is_valid_ipv6_address(tinfo.endpoint):
+                            sock.setsockopt(zmq.IPV6, 1)
+                        sock.connect(ep)
+                        self._prefetch_sockets[ep] = sock
+                    self._prefetch_sockets[ep].send_multipart([
                         b"STAGING_REQ",
                         str(room).encode("ascii"),
                         str(chunk_idx).encode("ascii"),
@@ -1598,8 +1638,25 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     with self._watermark_cv:
                         prev = self.remote_watermarks.get(wm_session, (0, 0))
-                        self.remote_watermarks[wm_session] = (wm_round, wm_tail)
-                        self._watermark_cv.notify_all()
+                        is_regression = (
+                            (wm_round < prev[0])
+                            or (wm_round == prev[0] and wm_tail < prev[1])
+                        )
+                        if is_regression:
+                            logger.warning(
+                                "[WM-RECV-REGRESS] prefill_tp=%d prefill_dp=%d "
+                                "session=%s new=(%d,%d) prev=(%d,%d) ignored=True",
+                                self.attn_tp_rank,
+                                self.attn_dp_rank,
+                                wm_session,
+                                wm_round,
+                                wm_tail,
+                                prev[0],
+                                prev[1],
+                            )
+                        else:
+                            self.remote_watermarks[wm_session] = (wm_round, wm_tail)
+                            self._watermark_cv.notify_all()
                     decode_info = self.decode_kv_args_table.get(wm_session)
                     dst_tp = getattr(decode_info, "dst_tp_rank", "?") if decode_info else "?"
                     if _STAGING_DEBUG:
@@ -1715,9 +1772,44 @@ class MooncakeKVManager(CommonKVManager):
                         arrived_response_num = len(
                             self.prefill_response_tracker[bootstrap_room]
                         )
+                        if _STAGING_DEBUG:
+                            logger.info(
+                                "[STATUS-RECV] decode_tp=%d room=%s prefill_rank=%d "
+                                "status=Success arrived=%d expected=%d tracker=%s",
+                                self.attn_tp_rank,
+                                bootstrap_room,
+                                prefill_rank,
+                                arrived_response_num,
+                                expected_response_num,
+                                sorted(self.prefill_response_tracker[bootstrap_room]),
+                            )
                         if arrived_response_num == expected_response_num:
+                            if _STAGING_DEBUG:
+                                logger.info(
+                                    "[STATUS-COMMIT] decode_tp=%d room=%s "
+                                    "status=Success tracker=%s",
+                                    self.attn_tp_rank,
+                                    bootstrap_room,
+                                    sorted(self.prefill_response_tracker[bootstrap_room]),
+                                )
                             self.update_status(bootstrap_room, KVPoll.Success)
+                    elif _STAGING_DEBUG:
+                        logger.warning(
+                            "[STATUS-RECV-IGNORED] decode_tp=%d room=%s "
+                            "prefill_rank=%d status=Success request_status_missing=True",
+                            self.attn_tp_rank,
+                            bootstrap_room,
+                            prefill_rank,
+                        )
                 elif status == KVPoll.Failed:
+                    if _STAGING_DEBUG:
+                        logger.warning(
+                            "[STATUS-RECV] decode_tp=%d room=%s prefill_rank=%d "
+                            "status=Failed",
+                            self.attn_tp_rank,
+                            bootstrap_room,
+                            prefill_rank,
+                        )
                     self.record_failure(
                         bootstrap_room,
                         "Failed to get kvcache from prefill instance, it might be dead",
