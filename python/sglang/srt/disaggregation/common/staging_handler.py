@@ -58,7 +58,8 @@ class DecodeStagingHandler:
         kv_manager = getattr(scheduler, "_decode_kv_manager", None)
         if kv_manager is None:
             return None
-        staging_allocator = getattr(kv_manager, "staging_allocator", None)
+        _stg = getattr(kv_manager, "_staging", None)
+        staging_allocator = getattr(_stg, "allocator", None) if _stg else None
         if staging_allocator is None:
             return None
         kv_buffer_info = getattr(kv_manager, "kv_buffer_tensors", None)
@@ -104,7 +105,8 @@ class DecodeStagingHandler:
           3. Check event.query() -> if done, free watermark and mark done
         """
         room = decode_req.req.bootstrap_room
-        pending = getattr(self.kv_manager, "pending_chunk_scatters", {})
+        _stg = getattr(self.kv_manager, "_staging", None)
+        pending = getattr(_stg, "pending_chunk_scatters", {}) if _stg else {}
 
         if room in pending and pending[room]:
             self._process_pending_chunk_scatters(queue)
@@ -260,7 +262,8 @@ class DecodeStagingHandler:
 
     def _process_pending_chunk_scatters(self, queue: list) -> None:
         """Submit async scatter for CHUNK_READY tasks."""
-        pending = getattr(self.kv_manager, "pending_chunk_scatters", {})
+        _stg = getattr(self.kv_manager, "_staging", None)
+        pending = getattr(_stg, "pending_chunk_scatters", {}) if _stg else {}
         if not pending:
             return
 
@@ -379,15 +382,13 @@ class PrefillStagingStrategy:
             else 0
         )
 
-        if (
-            chunk_idx >= len(req.staging_offsets)
-            or req.staging_offsets[chunk_idx] < 0
-        ):
+        stg = req.staging
+        if stg is None or chunk_idx >= len(stg.offsets) or stg.offsets[chunk_idx] < 0:
             return (False, chunk_idx, -1, 0, -1)
 
-        c_offset = req.staging_offsets[chunk_idx]
-        c_round = req.staging_rounds[chunk_idx]
-        c_end = req.staging_ends[chunk_idx]
+        c_offset = stg.offsets[chunk_idx]
+        c_round = stg.rounds[chunk_idx]
+        c_end = stg.ends[chunk_idx]
 
         if not self.kv_manager._is_watermark_ready(
             req.mooncake_session_id, c_round, c_end
@@ -586,7 +587,8 @@ def allocate_chunk_staging_for_receiver(kv_mgr, kv_indices) -> list:
     Extracted from MooncakeKVReceiver._allocate_chunk_staging.
     Returns list of (alloc_id, offset, round, end) per chunk.
     """
-    staging_allocator = getattr(kv_mgr, "staging_allocator", None)
+    _stg = getattr(kv_mgr, "_staging", None)
+    staging_allocator = getattr(_stg, "allocator", None) if _stg else None
     if staging_allocator is None:
         return []
 
@@ -629,3 +631,74 @@ def allocate_chunk_staging_for_receiver(kv_mgr, kv_indices) -> list:
         bytes_per_head_per_token,
         num_kv_layers,
     )
+
+
+def is_watermark_ready(
+    staging_state, session_id: str, alloc_round: int, alloc_end: int
+) -> bool:
+    """Non-blocking check: is the staging region safe to write?"""
+    if alloc_round <= 0:
+        return True
+    prev_round = alloc_round - 1
+    wm_round, wm_tail = staging_state.remote_watermarks.get(session_id, (0, 0))
+    return prev_round < wm_round or (
+        prev_round == wm_round and alloc_end <= wm_tail
+    )
+
+
+def prefetch_staging_reqs(
+    room: int,
+    transfer_infos: dict,
+    kv_buffer_tensors: dict,
+    chunked_prefill_size: int,
+    staging_requested: set,
+    prefetch_sockets: dict,
+) -> None:
+    """Send STAGING_REQ for all chunks before the prefill forward starts.
+
+    Called from the scheduler right after batch formation, so that decode
+    allocates staging during the GPU forward pass.
+    """
+    import zmq
+
+    from sglang.srt.utils import format_tcp_address, is_valid_ipv6_address
+
+    page_size = kv_buffer_tensors["page_size"]
+    cps = chunked_prefill_size or 8192
+    full_chunk_pages = max(1, cps // page_size)
+
+    for session_id, tinfo in transfer_infos[room].items():
+        if tinfo.is_dummy:
+            continue
+        total_pages = len(tinfo.dst_kv_indices)
+        if total_pages == 0:
+            continue
+        num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages
+
+        for chunk_idx in range(num_chunks):
+            stg_key = (room, chunk_idx, session_id)
+            if stg_key in staging_requested:
+                continue
+            staging_requested.add(stg_key)
+
+            remaining = total_pages - chunk_idx * full_chunk_pages
+            chunk_pages = min(full_chunk_pages, remaining)
+            try:
+                ep = format_tcp_address(tinfo.endpoint, tinfo.dst_port)
+                if ep not in prefetch_sockets:
+                    sock = zmq.Context().socket(zmq.PUSH)
+                    if is_valid_ipv6_address(tinfo.endpoint):
+                        sock.setsockopt(zmq.IPV6, 1)
+                    sock.connect(ep)
+                    prefetch_sockets[ep] = sock
+                prefetch_sockets[ep].send_multipart(
+                    [
+                        b"STAGING_REQ",
+                        str(room).encode("ascii"),
+                        str(chunk_idx).encode("ascii"),
+                        str(chunk_pages).encode("ascii"),
+                        session_id.encode("ascii"),
+                    ]
+                )
+            except Exception:
+                staging_requested.discard(stg_key)

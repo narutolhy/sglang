@@ -59,6 +59,58 @@ class TransferKVChunk:
     state_indices: Optional[List[int]]
 
 
+@dataclasses.dataclass
+class StagingTransferInfo:
+    """Per-chunk staging allocation info attached to a TransferInfo."""
+
+    offsets: List[int] = dataclasses.field(default_factory=lambda: [-1])
+    rounds: List[int] = dataclasses.field(default_factory=lambda: [0])
+    ends: List[int] = dataclasses.field(default_factory=lambda: [-1])
+
+    @staticmethod
+    def _parse_csv_ints(raw: str, default: int) -> List[int]:
+        if not raw or raw == "":
+            return [default]
+        return [int(x) for x in raw.split(",")]
+
+    @classmethod
+    def from_zmq_fields(cls, msg: List[bytes]) -> Optional["StagingTransferInfo"]:
+        offsets_raw = msg[8].decode("ascii") if len(msg) > 8 and msg[8] != b"" else ""
+        rounds_raw = msg[9].decode("ascii") if len(msg) > 9 and msg[9] != b"" else ""
+        ends_raw = msg[10].decode("ascii") if len(msg) > 10 and msg[10] != b"" else ""
+        if not offsets_raw and not rounds_raw and not ends_raw:
+            return None
+        return cls(
+            offsets=cls._parse_csv_ints(offsets_raw, -1),
+            rounds=cls._parse_csv_ints(rounds_raw, 0),
+            ends=cls._parse_csv_ints(ends_raw, -1),
+        )
+
+
+@dataclasses.dataclass
+class StagingRegisterInfo:
+    """Staging buffer registration info attached to a KVArgsRegisterInfo."""
+
+    base_ptr: int = 0
+    total_size: int = 0
+
+    @classmethod
+    def from_zmq_fields(cls, msg: List[bytes]) -> Optional["StagingRegisterInfo"]:
+        base_ptr = (
+            struct.unpack("Q", msg[12])[0]
+            if len(msg) > 12 and len(msg[12]) == 8
+            else 0
+        )
+        total_size = (
+            int(msg[13].decode("ascii"))
+            if len(msg) > 13 and len(msg[13]) > 0
+            else 0
+        )
+        if base_ptr == 0 and total_size == 0:
+            return None
+        return cls(base_ptr=base_ptr, total_size=total_size)
+
+
 # decode
 @dataclasses.dataclass
 class TransferInfo:
@@ -71,15 +123,7 @@ class TransferInfo:
     dst_state_indices: List[int]
     required_dst_info_num: int
     is_dummy: bool
-    staging_offsets: List[int] = dataclasses.field(default_factory=lambda: [-1])
-    staging_rounds: List[int] = dataclasses.field(default_factory=lambda: [0])
-    staging_ends: List[int] = dataclasses.field(default_factory=lambda: [-1])
-
-    @classmethod
-    def _parse_csv_ints(cls, raw: str, default: int) -> List[int]:
-        if not raw or raw == "":
-            return [default]
-        return [int(x) for x in raw.split(",")]
+    staging: Optional[StagingTransferInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -96,9 +140,6 @@ class TransferInfo:
             else:
                 dst_state_indices = list(np.frombuffer(msg[6], dtype=np.int32))
             is_dummy = False
-        offsets_raw = msg[8].decode("ascii") if len(msg) > 8 and msg[8] != b"" else ""
-        rounds_raw = msg[9].decode("ascii") if len(msg) > 9 and msg[9] != b"" else ""
-        ends_raw = msg[10].decode("ascii") if len(msg) > 10 and msg[10] != b"" else ""
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -109,9 +150,7 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
-            staging_offsets=cls._parse_csv_ints(offsets_raw, -1),
-            staging_rounds=cls._parse_csv_ints(rounds_raw, 0),
-            staging_ends=cls._parse_csv_ints(ends_raw, -1),
+            staging=StagingTransferInfo.from_zmq_fields(msg),
         )
 
 
@@ -128,12 +167,9 @@ class KVArgsRegisterInfo:
     dst_tp_rank: int
     dst_attn_tp_size: int
     dst_kv_item_len: int
-    # for mamba state different tp slice transfer
     dst_state_item_lens: list[int]
     dst_state_dim_per_tensor: list[int]
-    # for staging buffer based heterogeneous TP transfer (dynamic allocator)
-    dst_staging_base_ptr: int = 0
-    dst_staging_total_size: int = 0
+    staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -158,17 +194,29 @@ class KVArgsRegisterInfo:
                 if len(msg) > 11 and len(msg[11]) > 0
                 else []
             ),
-            dst_staging_base_ptr=(
-                struct.unpack("Q", msg[12])[0]
-                if len(msg) > 12 and len(msg[12]) == 8
-                else 0
-            ),
-            dst_staging_total_size=(
-                int(msg[13].decode("ascii"))
-                if len(msg) > 13 and len(msg[13]) > 0
-                else 0
-            ),
+            staging=StagingRegisterInfo.from_zmq_fields(msg),
         )
+
+
+@dataclasses.dataclass
+class PrefillStagingState:
+    """Staging-specific state for prefill mode."""
+
+    buffers: list = dataclasses.field(default_factory=list)
+    remote_watermarks: dict = dataclasses.field(default_factory=dict)
+    watermark_cv: threading.Condition = dataclasses.field(
+        default_factory=threading.Condition
+    )
+
+
+@dataclasses.dataclass
+class DecodeStagingState:
+    """Staging-specific state for decode mode."""
+
+    allocator: object = None
+    pending_chunk_scatters: dict = dataclasses.field(default_factory=dict)
+    room_bootstrap: dict = dataclasses.field(default_factory=dict)
+    room_receivers: dict = dataclasses.field(default_factory=dict)
 
 
 class AuxDataCodec:
@@ -209,10 +257,6 @@ class MooncakeKVManager(CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
-            self.remote_watermarks = (
-                {}
-            )  # session_id → (round, tail_offset) per decode rank
-            self._watermark_cv = threading.Condition()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -238,8 +282,8 @@ class MooncakeKVManager(CommonKVManager):
                 check_mooncake_custom_mem_pool_enabled()
             )
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-            self.staging_buffers = []
-            if self.enable_staging:
+            self._staging = PrefillStagingState() if self.enable_staging else None
+            if self._staging is not None:
                 self._init_staging_buffers(len(self.transfer_queues))
             for i, (queue, executor) in enumerate(
                 zip(self.transfer_queues, self.executors)
@@ -249,26 +293,65 @@ class MooncakeKVManager(CommonKVManager):
                     args=(
                         queue,
                         executor,
-                        self.staging_buffers[i] if self.staging_buffers else None,
+                        self._staging.buffers[i] if self._staging and self._staging.buffers else None,
                         i,
                     ),
                     daemon=True,
                 ).start()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-            self.staging_buffers = []
-            self.staging_allocator = None
-            self.pending_chunk_scatters = {}
-            self._room_bootstrap = {}
-            self._room_receivers = {}
-            if self.enable_staging:
+            self._staging = DecodeStagingState() if self.enable_staging else None
+            if self._staging is not None:
                 self._init_staging_allocator()
             self.start_decode_thread()
 
+    def init_engine(self):
+        self.engine = get_mooncake_transfer_engine()
+
+    def register_buffer_to_engine(self):
+        if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
+            self.engine.batch_register(
+                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+            )
+        if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
+            self.engine.batch_register(
+                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+            )
+        if self.kv_args.state_data_ptrs and self.kv_args.state_data_lens:
+            self.engine.batch_register(
+                self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+            )
+
+    # ------------------------------------------------------------------
+    # Staging buffer methods (all delegate to staging_handler.py)
+    # ------------------------------------------------------------------
+
     def register_room_bootstrap(self, room, bootstrap_infos, receiver):
-        """Store bootstrap connections and receiver for on-demand staging allocation."""
-        self._room_bootstrap[room] = bootstrap_infos
-        self._room_receivers[room] = receiver
+        self._staging.room_bootstrap[room] = bootstrap_infos
+        self._staging.room_receivers[room] = receiver
+
+    def set_kv_buffer_tensors(self, k_buffers: list, v_buffers: list, page_size: int):
+        self.kv_buffer_tensors = {
+            "k_buffers": k_buffers,
+            "v_buffers": v_buffers,
+            "page_size": page_size,
+        }
+
+    def _init_staging_buffers(self, count: int):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            init_staging_buffers,
+        )
+
+        self._staging.buffers = init_staging_buffers(self.engine, self.kv_args, count)
+        self.kv_buffer_tensors = None
+
+    def _init_staging_allocator(self):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            init_staging_allocator,
+        )
+
+        self._staging.allocator = init_staging_allocator(self.engine, self.kv_args)
+        self.kv_buffer_tensors = None
 
     def _handle_staging_req(self, msg):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -277,72 +360,23 @@ class MooncakeKVManager(CommonKVManager):
 
         handle_staging_req(
             msg,
-            self.staging_allocator,
+            self._staging.allocator if self._staging else None,
             self.kv_args,
             self.attn_tp_size,
             getattr(self, "prefill_attn_tp_size", self.attn_tp_size),
             getattr(self, "kv_buffer_tensors", None),
-            self._room_receivers,
-            self._room_bootstrap,
+            self._staging.room_receivers if self._staging else {},
+            self._staging.room_bootstrap if self._staging else {},
         )
-
-    def init_engine(self):
-        self.engine = get_mooncake_transfer_engine()
-
-    def register_buffer_to_engine(self):
-        # Batch register KV data buffers
-        if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
-            self.engine.batch_register(
-                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
-            )
-
-        # Batch register auxiliary data buffers
-        if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
-            self.engine.batch_register(
-                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
-            )
-
-        # Batch register state/extra pool data buffers
-        if self.kv_args.state_data_ptrs and self.kv_args.state_data_lens:
-            self.engine.batch_register(
-                self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
-            )
-
-    def _init_staging_buffers(self, count: int):
-        from sglang.srt.disaggregation.common.staging_handler import (
-            init_staging_buffers,
-        )
-
-        self.staging_buffers = init_staging_buffers(self.engine, self.kv_args, count)
-        self.kv_buffer_tensors = None
-
-    def _init_staging_allocator(self):
-        from sglang.srt.disaggregation.common.staging_handler import (
-            init_staging_allocator,
-        )
-
-        self.staging_allocator = init_staging_allocator(self.engine, self.kv_args)
-        self.kv_buffer_tensors = None
-
-    def set_kv_buffer_tensors(self, k_buffers: list, v_buffers: list, page_size: int):
-        """Store references to the actual KV pool tensors for GPU gather/scatter."""
-        self.kv_buffer_tensors = {
-            "k_buffers": k_buffers,
-            "v_buffers": v_buffers,
-            "page_size": page_size,
-        }
 
     def _is_watermark_ready(
         self, session_id: str, alloc_round: int, alloc_end: int
     ) -> bool:
-        """Non-blocking check: is the staging region safe to write?"""
-        if alloc_round <= 0:
-            return True
-        prev_round = alloc_round - 1
-        wm_round, wm_tail = self.remote_watermarks.get(session_id, (0, 0))
-        return prev_round < wm_round or (
-            prev_round == wm_round and alloc_end <= wm_tail
+        from sglang.srt.disaggregation.common.staging_handler import (
+            is_watermark_ready,
         )
+
+        return is_watermark_ready(self._staging, session_id, alloc_round, alloc_end)
 
     def send_kvcache_staged(
         self,
@@ -1053,7 +1087,8 @@ class MooncakeKVManager(CommonKVManager):
                         use_staging = (
                             not tp_match
                             and staging_strategy is not None
-                            and target_rank_registration_info.dst_staging_base_ptr > 0
+                            and target_rank_registration_info.staging is not None
+                            and target_rank_registration_info.staging.base_ptr > 0
                         )
                         if not use_staging and not tp_match:
                             logger.warning_once(
@@ -1083,8 +1118,8 @@ class MooncakeKVManager(CommonKVManager):
                             ret = staging_strategy.transfer(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_staging_base_ptr + c_offset,
-                                target_rank_registration_info.dst_staging_total_size - c_offset,
+                                target_rank_registration_info.staging.base_ptr + c_offset,
+                                target_rank_registration_info.staging.total_size - c_offset,
                                 target_rank_registration_info,
                             )
                             if ret == -1:
@@ -1214,61 +1249,28 @@ class MooncakeKVManager(CommonKVManager):
                 )
 
     def _prefetch_staging_reqs(self, room: int):
-        """Send STAGING_REQ for all chunks before the prefill forward starts.
-
-        Called from the scheduler right after batch formation, so that decode
-        allocates staging during the GPU forward pass.  This avoids the
-        round-trip latency that would otherwise block the transfer worker.
-        """
         if not self.enable_staging:
             return
         kv_buf = getattr(self, "kv_buffer_tensors", None)
         if kv_buf is None:
             return
-        page_size = kv_buf["page_size"]
-        cps = self.server_args.chunked_prefill_size or 8192
-        full_chunk_pages = max(1, cps // page_size)
-
         if not hasattr(self, "_staging_requested"):
             self._staging_requested = set()
         if not hasattr(self, "_prefetch_sockets"):
             self._prefetch_sockets = {}
 
-        for session_id, tinfo in self.transfer_infos[room].items():
-            if tinfo.is_dummy:
-                continue
-            total_pages = len(tinfo.dst_kv_indices)
-            if total_pages == 0:
-                continue
-            num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages
+        from sglang.srt.disaggregation.common.staging_handler import (
+            prefetch_staging_reqs,
+        )
 
-            for chunk_idx in range(num_chunks):
-                stg_key = (room, chunk_idx, session_id)
-                if stg_key in self._staging_requested:
-                    continue
-                self._staging_requested.add(stg_key)
-
-                remaining = total_pages - chunk_idx * full_chunk_pages
-                chunk_pages = min(full_chunk_pages, remaining)
-                try:
-                    ep = format_tcp_address(tinfo.endpoint, tinfo.dst_port)
-                    if ep not in self._prefetch_sockets:
-                        sock = zmq.Context().socket(zmq.PUSH)
-                        if is_valid_ipv6_address(tinfo.endpoint):
-                            sock.setsockopt(zmq.IPV6, 1)
-                        sock.connect(ep)
-                        self._prefetch_sockets[ep] = sock
-                    self._prefetch_sockets[ep].send_multipart(
-                        [
-                            b"STAGING_REQ",
-                            str(room).encode("ascii"),
-                            str(chunk_idx).encode("ascii"),
-                            str(chunk_pages).encode("ascii"),
-                            session_id.encode("ascii"),
-                        ]
-                    )
-                except Exception:
-                    self._staging_requested.discard(stg_key)
+        prefetch_staging_reqs(
+            room,
+            self.transfer_infos,
+            kv_buf,
+            self.server_args.chunked_prefill_size,
+            self._staging_requested,
+            self._prefetch_sockets,
+        )
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -1285,8 +1287,8 @@ class MooncakeKVManager(CommonKVManager):
                         if len(waiting_req_bytes) > 3
                         else ""
                     )
-                    with self._watermark_cv:
-                        prev = self.remote_watermarks.get(wm_session, (0, 0))
+                    with self._staging.watermark_cv:
+                        prev = self._staging.remote_watermarks.get(wm_session, (0, 0))
                         is_regression = (wm_round < prev[0]) or (
                             wm_round == prev[0] and wm_tail < prev[1]
                         )
@@ -1303,11 +1305,11 @@ class MooncakeKVManager(CommonKVManager):
                                 prev[1],
                             )
                         else:
-                            self.remote_watermarks[wm_session] = (
+                            self._staging.remote_watermarks[wm_session] = (
                                 wm_round,
                                 wm_tail,
                             )
-                            self._watermark_cv.notify_all()
+                            self._staging.watermark_cv.notify_all()
                     continue
                 if room == "STAGING_RSP":
                     stg_room = int(waiting_req_bytes[1].decode("ascii"))
@@ -1319,13 +1321,16 @@ class MooncakeKVManager(CommonKVManager):
                     room_infos = self.transfer_infos.get(stg_room, {})
                     tinfo = room_infos.get(stg_session)
                     if tinfo is not None:
-                        while len(tinfo.staging_offsets) <= stg_chunk_idx:
-                            tinfo.staging_offsets.append(-1)
-                            tinfo.staging_rounds.append(0)
-                            tinfo.staging_ends.append(-1)
-                        tinfo.staging_offsets[stg_chunk_idx] = stg_offset
-                        tinfo.staging_rounds[stg_chunk_idx] = stg_round
-                        tinfo.staging_ends[stg_chunk_idx] = stg_end
+                        if tinfo.staging is None:
+                            tinfo.staging = StagingTransferInfo()
+                        stg = tinfo.staging
+                        while len(stg.offsets) <= stg_chunk_idx:
+                            stg.offsets.append(-1)
+                            stg.rounds.append(0)
+                            stg.ends.append(-1)
+                        stg.offsets[stg_chunk_idx] = stg_offset
+                        stg.rounds[stg_chunk_idx] = stg_round
+                        stg.ends[stg_chunk_idx] = stg_end
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
@@ -1370,9 +1375,9 @@ class MooncakeKVManager(CommonKVManager):
                     page_start = int(msg[3].decode("ascii"))
                     num_pages = int(msg[4].decode("ascii"))
                     session_id = msg[5].decode("ascii")
-                    if room not in self.pending_chunk_scatters:
-                        self.pending_chunk_scatters[room] = []
-                    self.pending_chunk_scatters[room].append(
+                    if room not in self._staging.pending_chunk_scatters:
+                        self._staging.pending_chunk_scatters[room] = []
+                    self._staging.pending_chunk_scatters[room].append(
                         (chunk_idx, page_start, num_pages, session_id)
                     )
                     continue
@@ -1683,14 +1688,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
 
-            staging_allocator = getattr(self.kv_mgr, "staging_allocator", None)
-            if staging_allocator is not None:
-                packed_staging_base_ptr = struct.pack(
-                    "Q", staging_allocator.get_base_ptr()
-                )
-                staging_total_size_str = str(staging_allocator.get_total_size()).encode(
-                    "ascii"
-                )
+            _stg = getattr(self.kv_mgr, "_staging", None)
+            _alloc = getattr(_stg, "allocator", None) if _stg else None
+            if _alloc is not None:
+                packed_staging_base_ptr = struct.pack("Q", _alloc.get_base_ptr())
+                staging_total_size_str = str(_alloc.get_total_size()).encode("ascii")
             else:
                 packed_staging_base_ptr = b""
                 staging_total_size_str = b""
@@ -1737,8 +1739,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
 
-        staging_allocator = getattr(self.kv_mgr, "staging_allocator", None)
-        if staging_allocator is not None:
+        _stg = getattr(self.kv_mgr, "_staging", None)
+        if _stg is not None and getattr(_stg, "allocator", None) is not None:
             self.chunk_staging_infos = []
             self.kv_mgr.register_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
