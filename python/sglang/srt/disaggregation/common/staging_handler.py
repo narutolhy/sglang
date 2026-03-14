@@ -90,14 +90,10 @@ class StagingRegisterInfo:
     @classmethod
     def from_zmq_fields(cls, msg: list) -> Optional["StagingRegisterInfo"]:
         base_ptr = (
-            struct.unpack("Q", msg[12])[0]
-            if len(msg) > 12 and len(msg[12]) == 8
-            else 0
+            struct.unpack("Q", msg[12])[0] if len(msg) > 12 and len(msg[12]) == 8 else 0
         )
         total_size = (
-            int(msg[13].decode("ascii"))
-            if len(msg) > 13 and len(msg[13]) > 0
-            else 0
+            int(msg[13].decode("ascii")) if len(msg) > 13 and len(msg[13]) > 0 else 0
         )
         if base_ptr == 0 and total_size == 0:
             return None
@@ -238,9 +234,7 @@ class DecodeStagingHandler:
 
         event = getattr(decode_req, "_scatter_event", None)
         if event is not None and event.query():
-            self._free_and_send_watermark(
-                decode_req._scatter_alloc_id, decode_req
-            )
+            self._free_and_send_watermark(decode_req._scatter_alloc_id, decode_req)
             decode_req._scatter_event = None
             decode_req._scatter_alloc_id = -1
             decode_req._staging_scatter_done = True
@@ -352,9 +346,7 @@ class DecodeStagingHandler:
             session_id = getattr(receiver, "session_id", "")
             for bootstrap_info in receiver.bootstrap_infos:
                 try:
-                    sock, lock = receiver._connect_to_bootstrap_server(
-                        bootstrap_info
-                    )
+                    sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
                     with lock:
                         sock.send_multipart(
                             [
@@ -390,9 +382,7 @@ class DecodeStagingHandler:
             decode_req = room_to_req.get(room)
             if decode_req is None:
                 continue
-            chunk_infos = getattr(
-                decode_req.kv_receiver, "chunk_staging_infos", []
-            )
+            chunk_infos = getattr(decode_req.kv_receiver, "chunk_staging_infos", [])
             if not chunk_infos:
                 continue
 
@@ -407,9 +397,7 @@ class DecodeStagingHandler:
             for chunk_idx, group in by_chunk.items():
                 if chunk_idx >= len(chunk_infos):
                     continue
-                alloc_id, staging_offset, staging_round, _ = chunk_infos[
-                    chunk_idx
-                ]
+                alloc_id, staging_offset, staging_round, _ = chunk_infos[chunk_idx]
                 if staging_offset < 0:
                     continue
                 if len(group) < num_writers:
@@ -565,9 +553,7 @@ def init_staging_buffers(engine, kv_args, count: int) -> list:
 
     buffers = []
     for _ in range(count):
-        buf = StagingBuffer(
-            size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool
-        )
+        buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
         engine.batch_register([buf.get_ptr()], [buf.get_size()])
         buffers.append(buf)
     return buffers
@@ -591,9 +577,7 @@ def init_staging_allocator(engine, kv_args):
 
     _, custom_mem_pool, _ = init_mooncake_custom_mem_pool(device)
     allocator = StagingAllocator(pool_size_bytes, device, gpu_id, custom_mem_pool)
-    engine.batch_register(
-        [allocator.get_base_ptr()], [allocator.get_total_size()]
-    )
+    engine.batch_register([allocator.get_base_ptr()], [allocator.get_total_size()])
     return allocator
 
 
@@ -748,9 +732,7 @@ def is_watermark_ready(
         return True
     prev_round = alloc_round - 1
     wm_round, wm_tail = staging_state.remote_watermarks.get(session_id, (0, 0))
-    return prev_round < wm_round or (
-        prev_round == wm_round and alloc_end <= wm_tail
-    )
+    return prev_round < wm_round or (prev_round == wm_round and alloc_end <= wm_tail)
 
 
 def prefetch_staging_reqs(

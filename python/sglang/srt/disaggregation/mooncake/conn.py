@@ -13,7 +13,6 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
-import zmq
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -228,7 +227,11 @@ class MooncakeKVManager(CommonKVManager):
                     args=(
                         queue,
                         executor,
-                        self._staging.buffers[i] if self._staging and self._staging.buffers else None,
+                        (
+                            self._staging.buffers[i]
+                            if self._staging and self._staging.buffers
+                            else None
+                        ),
                         i,
                     ),
                     daemon=True,
@@ -342,16 +345,26 @@ class MooncakeKVManager(CommonKVManager):
         except Exception:
             pass
 
-    def _do_staging_transfer(self, staging_strategy, kv_chunk, req,
-                             target_info, chunked_dst_kv_indice, executor,
-                             queue, local_rank):
+    def _do_staging_transfer(
+        self,
+        staging_strategy,
+        kv_chunk,
+        req,
+        target_info,
+        chunked_dst_kv_indice,
+        executor,
+        queue,
+        local_rank,
+    ):
         """Execute staging transfer for one chunk. Returns (ret, deferred).
 
         Handles readiness check, transfer, fallback, and CHUNK_READY notification.
         deferred=True means caller should re-enqueue and break.
         """
         ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
-            req, kv_chunk.index_slice.start, len(kv_chunk.prefill_kv_indices),
+            req,
+            kv_chunk.index_slice.start,
+            len(kv_chunk.prefill_kv_indices),
         )
         if not ready:
             queue.put(kv_chunk)
@@ -1050,9 +1063,7 @@ class MooncakeKVManager(CommonKVManager):
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 if staging_strategy is None and staging_buffer is not None:
-                    staging_strategy = self._try_create_staging_strategy(
-                        staging_buffer
-                    )
+                    staging_strategy = self._try_create_staging_strategy(staging_buffer)
                 reqs_to_be_processed = (
                     self.transfer_infos[kv_chunk.room].values()
                     if kv_chunk.room in self.transfer_infos
@@ -1061,7 +1072,7 @@ class MooncakeKVManager(CommonKVManager):
                 polls = []
                 dst_ranks_infos = []
                 local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
-                watermark_deferred = False
+                staging_deferred = False
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -1114,13 +1125,17 @@ class MooncakeKVManager(CommonKVManager):
                             and target_rank_registration_info.staging is not None
                         ):
                             ret, deferred = self._do_staging_transfer(
-                                staging_strategy, kv_chunk, req,
+                                staging_strategy,
+                                kv_chunk,
+                                req,
                                 target_rank_registration_info,
-                                chunked_dst_kv_indice, executor, queue,
+                                chunked_dst_kv_indice,
+                                executor,
+                                queue,
                                 local_rank,
                             )
                             if deferred:
-                                watermark_deferred = True
+                                staging_deferred = True
                                 break
                         else:
                             ret = self.send_kvcache_slice(
@@ -1191,7 +1206,7 @@ class MooncakeKVManager(CommonKVManager):
                         if kv_chunk.is_last and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
 
-                if watermark_deferred:
+                if staging_deferred:
                     continue
 
                 if (
