@@ -65,63 +65,6 @@ class StagingBuffer:
         return required_bytes <= self.size_bytes
 
 
-class RecvSlotPool:
-    """Decode-side pre-allocated recv staging slot pool.
-
-    Each slot is a StagingBuffer that can hold one request's KV data
-    from all prefill ranks. Slots are assigned per-request and freed
-    after scatter completes. Thread-safe via mutex.
-    """
-
-    def __init__(
-        self,
-        num_slots: int,
-        slot_size_bytes: int,
-        device: str,
-        gpu_id: int,
-        custom_mem_pool=None,
-    ):
-        self.num_slots = num_slots
-        self.slot_size_bytes = slot_size_bytes
-        self.slots: List[StagingBuffer] = []
-        self.flags: List[int] = [0] * num_slots  # 0=free, 1=occupied
-        self.lock = threading.Lock()
-
-        for i in range(num_slots):
-            buf = StagingBuffer(slot_size_bytes, device, gpu_id, custom_mem_pool)
-            self.slots.append(buf)
-
-        logger.info(
-            f"RecvSlotPool: {num_slots} slots x "
-            f"{slot_size_bytes / (1024*1024):.1f} MB = "
-            f"{num_slots * slot_size_bytes / (1024*1024):.1f} MB total"
-        )
-
-    def assign(self) -> Optional[int]:
-        """Assign a free slot. Returns slot_id or None if all occupied."""
-        with self.lock:
-            for i, flag in enumerate(self.flags):
-                if flag == 0:
-                    self.flags[i] = 1
-                    return i
-            return None
-
-    def free(self, slot_id: int):
-        """Release a slot back to the pool."""
-        with self.lock:
-            self.flags[slot_id] = 0
-
-    def get_slot(self, slot_id: int) -> StagingBuffer:
-        return self.slots[slot_id]
-
-    def get_all_ptrs(self) -> List[int]:
-        """Return all slot GPU pointers for bootstrap registration."""
-        return [slot.get_ptr() for slot in self.slots]
-
-    def get_all_sizes(self) -> List[int]:
-        return [slot.get_size() for slot in self.slots]
-
-
 class StagingAllocator:
     """Decode-side dynamic staging ring buffer allocator with overcommit.
 
@@ -227,23 +170,6 @@ class StagingAllocator:
 
     def get_total_size(self) -> int:
         return self.total_size
-
-
-def compute_staging_layout(
-    num_tokens: int,
-    num_heads: int,
-    head_dim: int,
-    dtype_size: int,
-    num_layers: int,
-) -> Tuple[int, int]:
-    """Compute per-layer and total staging buffer size in bytes.
-
-    Returns:
-        (per_layer_bytes, total_bytes)
-    """
-    per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
-    total_bytes = per_layer_bytes * num_layers * 2  # K + V
-    return per_layer_bytes, total_bytes
 
 
 def gather_kv_head_slices(

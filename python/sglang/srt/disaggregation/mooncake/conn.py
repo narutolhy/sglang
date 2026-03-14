@@ -449,47 +449,6 @@ class MooncakeKVManager(CommonKVManager):
             prev_round == wm_round and alloc_end <= wm_tail
         )
 
-    def _wait_for_watermark(self, session_id: str, alloc_round: int, alloc_end: int):
-        """Block until the previous round's occupant of this staging region is freed.
-
-        The decode side sends WATERMARK(round, tail) after freeing each allocation.
-        A region at (alloc_round, alloc_end) is safe to write when the previous round
-        (alloc_round - 1) has been freed past alloc_end.
-        """
-        if alloc_round <= 0:
-            return
-        prev_round = alloc_round - 1
-        wait_start = time.monotonic()
-        poll_count = 0
-        with self._watermark_cv:
-            wm_round, wm_tail = self.remote_watermarks.get(session_id, (0, 0))
-            if prev_round < wm_round or (
-                prev_round == wm_round and alloc_end <= wm_tail
-            ):
-                return
-            while True:
-                wm_round, wm_tail = self.remote_watermarks.get(session_id, (0, 0))
-                if prev_round < wm_round or (
-                    prev_round == wm_round and alloc_end <= wm_tail
-                ):
-                    break
-                poll_count += 1
-                if poll_count % 100 == 0:
-                    elapsed = time.monotonic() - wait_start
-                    logger.warning(
-                        "[WM-WAIT STALL] session=%s waiting %.1fs "
-                        "need prev_round=%d alloc_end=%d current wm=(%d,%d) "
-                        "polls=%d",
-                        session_id,
-                        elapsed,
-                        prev_round,
-                        alloc_end,
-                        wm_round,
-                        wm_tail,
-                        poll_count,
-                    )
-                self._watermark_cv.wait(timeout=0.1)
-
     def send_kvcache_staged(
         self,
         mooncake_session_id: str,

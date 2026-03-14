@@ -1105,17 +1105,6 @@ class DecodeTransferQueue:
                 except Exception:
                     pass
 
-    def _complete_async_scatter(self, decode_req: DecodeRequest) -> None:
-        """Wait for scatter event, then free staging and send watermark."""
-        ctx = self.staging_ctx
-        if ctx is not None:
-            _, _, kv_buffer_info, _, _, _ = ctx
-            device = kv_buffer_info["k_buffers"][0].device
-            torch.cuda.default_stream(device).wait_event(decode_req._scatter_event)
-        self._free_and_send_watermark(decode_req._scatter_alloc_id, decode_req)
-        decode_req._scatter_event = None
-        decode_req._scatter_alloc_id = -1
-
     def _process_pending_chunk_scatters(self):
         """Submit async scatter for CHUNK_READY tasks, tracked via per-req event lists."""
         ctx = self.staging_ctx
