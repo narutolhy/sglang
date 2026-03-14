@@ -350,9 +350,7 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
-    def _prefetch_staging_for_batch(
-        self: Scheduler, batch: ScheduleBatch
-    ) -> None:
+    def _prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
         prefetch = getattr(kv_mgr, "_prefetch_staging_reqs", None)

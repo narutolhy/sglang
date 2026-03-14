@@ -306,7 +306,8 @@ class MooncakeKVManager(CommonKVManager):
             attn_tp_size = self.attn_tp_size
             prefill_attn_tp = getattr(self, "prefill_attn_tp_size", attn_tp_size)
             total_kv_heads = resolve_total_kv_heads(
-                self.kv_args, attn_tp_size,
+                self.kv_args,
+                attn_tp_size,
                 kv_buffer_tensors=getattr(self, "kv_buffer_tensors", None),
             )
             dst_heads_per_rank = max(1, total_kv_heads // max(1, attn_tp_size))
@@ -315,8 +316,12 @@ class MooncakeKVManager(CommonKVManager):
 
             chunk_tokens = chunk_num_pages * page_size
             _, _, required = compute_staging_layout(
-                prefill_attn_tp, attn_tp_size, dst_tp_rank,
-                total_kv_heads, chunk_tokens, bytes_per_head_per_token,
+                prefill_attn_tp,
+                attn_tp_size,
+                dst_tp_rank,
+                total_kv_heads,
+                chunk_tokens,
+                bytes_per_head_per_token,
                 num_kv_layers,
             )
             result = self.staging_allocator.assign(required)
@@ -335,8 +340,14 @@ class MooncakeKVManager(CommonKVManager):
                 logger.info(
                     "[STAGING-RECV] decode_tp=%d room=%s chunk=%d session=%s "
                     "type=REQ alloc_id=%d offset=%d round=%d end=%d",
-                    self.attn_tp_rank, room, chunk_idx, session_id,
-                    alloc_id, offset, rnd, end,
+                    self.attn_tp_rank,
+                    room,
+                    chunk_idx,
+                    session_id,
+                    alloc_id,
+                    offset,
+                    rnd,
+                    end,
                 )
 
         bootstrap_infos = self._room_bootstrap.get(room)
@@ -345,15 +356,17 @@ class MooncakeKVManager(CommonKVManager):
                 try:
                     sock, lock = receiver._connect_to_bootstrap_server(bi)
                     with lock:
-                        sock.send_multipart([
-                            b"STAGING_RSP",
-                            str(room).encode("ascii"),
-                            str(chunk_idx).encode("ascii"),
-                            str(offset).encode("ascii"),
-                            str(rnd).encode("ascii"),
-                            str(end).encode("ascii"),
-                            session_id.encode("ascii"),
-                        ])
+                        sock.send_multipart(
+                            [
+                                b"STAGING_RSP",
+                                str(room).encode("ascii"),
+                                str(chunk_idx).encode("ascii"),
+                                str(offset).encode("ascii"),
+                                str(rnd).encode("ascii"),
+                                str(end).encode("ascii"),
+                                session_id.encode("ascii"),
+                            ]
+                        )
                 except Exception:
                     pass
 
@@ -439,7 +452,9 @@ class MooncakeKVManager(CommonKVManager):
             "page_size": page_size,
         }
 
-    def _is_watermark_ready(self, session_id: str, alloc_round: int, alloc_end: int) -> bool:
+    def _is_watermark_ready(
+        self, session_id: str, alloc_round: int, alloc_end: int
+    ) -> bool:
         """Non-blocking check: is the staging region safe to write?"""
         if alloc_round <= 0:
             return True
@@ -470,7 +485,12 @@ class MooncakeKVManager(CommonKVManager):
             logger.info(
                 "[WM-WAIT] session=%s need prev_round=%d alloc_end=%d "
                 "current wm=(%d,%d) alloc_round=%d",
-                session_id, prev_round, alloc_end, wm_round, wm_tail, alloc_round,
+                session_id,
+                prev_round,
+                alloc_end,
+                wm_round,
+                wm_tail,
+                alloc_round,
             )
             while True:
                 wm_round, wm_tail = self.remote_watermarks.get(session_id, (0, 0))
@@ -485,8 +505,13 @@ class MooncakeKVManager(CommonKVManager):
                         "[WM-WAIT STALL] session=%s waiting %.1fs "
                         "need prev_round=%d alloc_end=%d current wm=(%d,%d) "
                         "polls=%d",
-                        session_id, elapsed, prev_round, alloc_end,
-                        wm_round, wm_tail, poll_count,
+                        session_id,
+                        elapsed,
+                        prev_round,
+                        alloc_end,
+                        wm_round,
+                        wm_tail,
+                        poll_count,
                     )
                 self._watermark_cv.wait(timeout=0.1)
         elapsed = time.monotonic() - wait_start
@@ -494,8 +519,13 @@ class MooncakeKVManager(CommonKVManager):
             logger.info(
                 "[WM-WAIT DONE] session=%s waited %.3fs polls=%d "
                 "need prev_round=%d alloc_end=%d final wm=(%d,%d)",
-                session_id, elapsed, poll_count,
-                prev_round, alloc_end, wm_round, wm_tail,
+                session_id,
+                elapsed,
+                poll_count,
+                prev_round,
+                alloc_end,
+                wm_round,
+                wm_tail,
             )
 
     def send_kvcache_staged(
@@ -1230,10 +1260,7 @@ class MooncakeKVManager(CommonKVManager):
                             )
                         elif use_staging:
                             page_size = self.kv_buffer_tensors["page_size"]
-                            cps = (
-                                self.server_args.chunked_prefill_size
-                                or 8192
-                            )
+                            cps = self.server_args.chunked_prefill_size or 8192
                             full_chunk_pages = max(1, cps // page_size)
                             chunk_pages = len(kv_chunk.prefill_kv_indices)
                             chunk_idx = (
@@ -1334,8 +1361,12 @@ class MooncakeKVManager(CommonKVManager):
                                 from datetime import datetime, timezone
 
                                 _t["after_rdma"] = time.time()
-                                _rdma_elapsed = (_t["after_rdma"] - _t["before_rdma"]) * 1000
-                                _wait_elapsed = (_t["after_rdma"] - kv_chunk._enqueue_time) * 1000
+                                _rdma_elapsed = (
+                                    _t["after_rdma"] - _t["before_rdma"]
+                                ) * 1000
+                                _wait_elapsed = (
+                                    _t["after_rdma"] - kv_chunk._enqueue_time
+                                ) * 1000
                                 if ret == 0:
                                     _enqueue_ts = datetime.fromtimestamp(
                                         kv_chunk._enqueue_time, tz=timezone.utc
@@ -1485,7 +1516,11 @@ class MooncakeKVManager(CommonKVManager):
                                         self.attn_tp_rank,
                                         req.room,
                                         req.mooncake_session_id,
-                                        "Success" if status == KVPoll.Success else "Failed",
+                                        (
+                                            "Success"
+                                            if status == KVPoll.Success
+                                            else "Failed"
+                                        ),
                                         local_rank,
                                         polls,
                                         req.required_dst_info_num,
@@ -1500,7 +1535,11 @@ class MooncakeKVManager(CommonKVManager):
                                             req.mooncake_session_id,
                                             endpoint,
                                             dst_port,
-                                            "Success" if status == KVPoll.Success else "Failed",
+                                            (
+                                                "Success"
+                                                if status == KVPoll.Success
+                                                else "Failed"
+                                            ),
                                             local_rank,
                                         )
                                     self.sync_status_to_decode_endpoint(
@@ -1544,8 +1583,14 @@ class MooncakeKVManager(CommonKVManager):
                     _t["loop_end"] = time.time()
                     _total_ms = (_t["loop_end"] - _t["loop_start"]) * 1000
                     if _total_ms > 50:
+
                         def _ms(a, b):
-                            return ((_t.get(b, 0) - _t.get(a, 0)) * 1000) if a in _t and b in _t else -1
+                            return (
+                                ((_t.get(b, 0) - _t.get(a, 0)) * 1000)
+                                if a in _t and b in _t
+                                else -1
+                            )
+
                         logger.warning(
                             f"[WORKER-SLOW] {_wtag} room={kv_chunk.room} "
                             f"chunk={kv_chunk.index_slice.start} is_last={kv_chunk.is_last} "
@@ -1611,13 +1656,15 @@ class MooncakeKVManager(CommonKVManager):
                             sock.setsockopt(zmq.IPV6, 1)
                         sock.connect(ep)
                         self._prefetch_sockets[ep] = sock
-                    self._prefetch_sockets[ep].send_multipart([
-                        b"STAGING_REQ",
-                        str(room).encode("ascii"),
-                        str(chunk_idx).encode("ascii"),
-                        str(chunk_pages).encode("ascii"),
-                        session_id.encode("ascii"),
-                    ])
+                    self._prefetch_sockets[ep].send_multipart(
+                        [
+                            b"STAGING_REQ",
+                            str(room).encode("ascii"),
+                            str(chunk_idx).encode("ascii"),
+                            str(chunk_pages).encode("ascii"),
+                            session_id.encode("ascii"),
+                        ]
+                    )
                 except Exception:
                     self._staging_requested.discard(stg_key)
 
@@ -1638,9 +1685,8 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     with self._watermark_cv:
                         prev = self.remote_watermarks.get(wm_session, (0, 0))
-                        is_regression = (
-                            (wm_round < prev[0])
-                            or (wm_round == prev[0] and wm_tail < prev[1])
+                        is_regression = (wm_round < prev[0]) or (
+                            wm_round == prev[0] and wm_tail < prev[1]
                         )
                         if is_regression:
                             logger.warning(
@@ -1658,13 +1704,21 @@ class MooncakeKVManager(CommonKVManager):
                             self.remote_watermarks[wm_session] = (wm_round, wm_tail)
                             self._watermark_cv.notify_all()
                     decode_info = self.decode_kv_args_table.get(wm_session)
-                    dst_tp = getattr(decode_info, "dst_tp_rank", "?") if decode_info else "?"
+                    dst_tp = (
+                        getattr(decode_info, "dst_tp_rank", "?") if decode_info else "?"
+                    )
                     if _STAGING_DEBUG:
                         logger.info(
                             "[WM-RECV] prefill_tp=%d prefill_dp=%d <- decode_tp=%s "
                             "session=%s wm=(%d,%d) prev=(%d,%d)",
-                            self.attn_tp_rank, self.attn_dp_rank, dst_tp,
-                            wm_session, wm_round, wm_tail, prev[0], prev[1],
+                            self.attn_tp_rank,
+                            self.attn_dp_rank,
+                            dst_tp,
+                            wm_session,
+                            wm_round,
+                            wm_tail,
+                            prev[0],
+                            prev[1],
                         )
                     continue
                 if room == "STAGING_RSP":
@@ -1688,8 +1742,12 @@ class MooncakeKVManager(CommonKVManager):
                         logger.info(
                             "[STAGING_RSP] room=%d chunk=%d offset=%d round=%d "
                             "end=%d session=%s",
-                            stg_room, stg_chunk_idx, stg_offset, stg_round,
-                            stg_end, stg_session,
+                            stg_room,
+                            stg_chunk_idx,
+                            stg_offset,
+                            stg_round,
+                            stg_end,
+                            stg_session,
                         )
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
@@ -1742,15 +1800,20 @@ class MooncakeKVManager(CommonKVManager):
                         (chunk_idx, page_start, num_pages, session_id)
                     )
                     group_len = sum(
-                        1 for c in self.pending_chunk_scatters[room]
+                        1
+                        for c in self.pending_chunk_scatters[room]
                         if c[0] == chunk_idx
                     )
                     if _STAGING_DEBUG:
                         logger.info(
                             "[STAGING-RECV] decode_tp=%d room=%s chunk=%d session=%s "
                             "type=READY prefill_rank=%s group_len=%d",
-                            self.attn_tp_rank, room, chunk_idx, session_id,
-                            prefill_rank, group_len,
+                            self.attn_tp_rank,
+                            room,
+                            chunk_idx,
+                            session_id,
+                            prefill_rank,
+                            group_len,
                         )
                     continue
 
@@ -1790,7 +1853,9 @@ class MooncakeKVManager(CommonKVManager):
                                     "status=Success tracker=%s",
                                     self.attn_tp_rank,
                                     bootstrap_room,
-                                    sorted(self.prefill_response_tracker[bootstrap_room]),
+                                    sorted(
+                                        self.prefill_response_tracker[bootstrap_room]
+                                    ),
                                 )
                             self.update_status(bootstrap_room, KVPoll.Success)
                     elif _STAGING_DEBUG:
@@ -1987,8 +2052,11 @@ class MooncakeKVSender(CommonKVSender):
             logger.info(
                 "[SEND-ENQUEUE] prefill_tp=%d room=%s chunk_start=%d "
                 "pages=%d is_last=%s",
-                self.kv_mgr.attn_tp_rank, self.bootstrap_room,
-                index_slice.start, len(kv_indices), is_last,
+                self.kv_mgr.attn_tp_rank,
+                self.bootstrap_room,
+                index_slice.start,
+                len(kv_indices),
+                is_last,
             )
 
         if not is_last:
@@ -2202,9 +2270,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 "ring_before=(round=%d,head=%d,allocs=%d) "
                 "ring_after=(round=%d,head=%d,allocs=%d) "
                 "chunk_rounds=%s wm=(%d,%d)",
-                self.bootstrap_room, len(kv_indices), len(result),
-                *pre_alloc_state, *post_alloc_state,
-                rounds_used, *staging_allocator.get_watermark(),
+                self.bootstrap_room,
+                len(kv_indices),
+                len(result),
+                *pre_alloc_state,
+                *post_alloc_state,
+                rounds_used,
+                *staging_allocator.get_watermark(),
             )
 
         return result
