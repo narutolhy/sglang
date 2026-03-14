@@ -490,13 +490,10 @@ class DecodePreallocQueue:
     def _update_handshake_waiters(
         self, rids_to_check: Optional[List[str]] = None
     ) -> None:
-        should_poll = len(self.queue) > 0 and not all(
-            d.waiting_for_input for d in self.queue
-        )
-        n = len(self.queue)
-        guard = torch.tensor([int(should_poll), n, -n], dtype=torch.int64, device="cpu")
-        dist.all_reduce(guard, op=dist.ReduceOp.MIN, group=self.gloo_group)
-        if guard[0].item() == 0 or guard[1].item() != -guard[2].item():
+        if not self.queue:
+            return
+
+        if all(decode_req.waiting_for_input for decode_req in self.queue):
             return
 
         polls = poll_and_all_reduce(
@@ -937,6 +934,23 @@ class DecodeTransferQueue:
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return True
 
+    def _poll_with_staging(self) -> list:
+        """Staging-aware polling: advance scatter, demote incomplete, all_reduce."""
+        self.staging_handler.process_pending_chunks(self.queue)
+        for decode_req in self.queue:
+            if not self.staging_handler.is_done(decode_req):
+                if decode_req.kv_receiver.poll() == KVPoll.Success:
+                    self.staging_handler.advance_scatter(decode_req, self.queue)
+
+        raw_polls = [int(dr.kv_receiver.poll()) for dr in self.queue]
+        for i, decode_req in enumerate(self.queue):
+            if raw_polls[i] == int(KVPoll.Success):
+                if not self.staging_handler.is_done(decode_req):
+                    raw_polls[i] = int(KVPoll.Transferring)
+        poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
+        dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=self.gloo_group)
+        return poll_tensor.tolist()
+
     def _init_staging_handler(self):
         """Create staging handler if heterogeneous TP staging is active."""
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -947,64 +961,17 @@ class DecodeTransferQueue:
             self.scheduler, self.tp_rank
         )
 
-    def _try_commit_and_finalize(
-        self,
-        decode_req: DecodeRequest,
-        indices_to_remove,
-        transferred_reqs,
-        i: int,
-    ):
-        """Commit transfer and handle abort/success bookkeeping. Returns True if removed."""
-        should_remove = self._commit_transfer_to_req(decode_req)
-        if not should_remove:
-            return False
-        indices_to_remove.add(i)
-        if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-            self.scheduler.stream_output(
-                [decode_req.req], decode_req.req.return_logprob
-            )
-            release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-            if self.scheduler.enable_metrics:
-                self.scheduler.metrics_collector.increment_transfer_failed_reqs()
-        else:
-            transferred_reqs.append(decode_req.req)
-        return True
-
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
-        # Staging hook 1: advance scatter state machine for in-flight requests
-        if self.staging_handler is not None:
-            self.staging_handler.process_pending_chunks(self.queue)
-            for decode_req in self.queue:
-                if not self.staging_handler.is_done(decode_req):
-                    if decode_req.kv_receiver.poll() == KVPoll.Success:
-                        self.staging_handler.try_advance(decode_req, self.queue)
-
-        # Guard check: ensure all TP ranks have same queue size before all_reduce
-        # (correctness fix — prevents tensor shape mismatch in poll all_reduce)
-        n = len(self.queue)
-        guard = torch.tensor(
-            [1 if self.queue else 0, n, -n],
-            dtype=torch.int64,
-            device="cpu",
-        )
-        dist.all_reduce(guard, op=dist.ReduceOp.MIN, group=self.gloo_group)
-        if guard[0].item() == 0 or guard[1].item() != -guard[2].item():
+        if not self.queue:
             return []
 
-        # Poll all receivers; staging hook 2: demote Success -> Transferring
-        # until local scatter is done (all_reduce MIN ensures all ranks agree)
-        raw_polls = [int(dr.kv_receiver.poll()) for dr in self.queue]
         if self.staging_handler is not None:
-            for i, decode_req in enumerate(self.queue):
-                if raw_polls[i] == int(KVPoll.Success):
-                    if not self.staging_handler.is_done(decode_req):
-                        raw_polls[i] = int(KVPoll.Transferring)
-        poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
-        dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=self.gloo_group)
-        polls = poll_tensor.tolist()
+            polls = self._poll_with_staging()
+        else:
+            polls = poll_and_all_reduce(
+                [dr.kv_receiver for dr in self.queue], self.gloo_group
+            )
 
-        # --- Phase 4: process poll results.  commit only when
-        # all_reduce confirms all TP ranks are ready.
         transferred_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
@@ -1032,12 +999,20 @@ class DecodeTransferQueue:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-                self._try_commit_and_finalize(
-                    decode_req,
-                    indices_to_remove,
-                    transferred_reqs,
-                    i,
-                )
+                should_remove = self._commit_transfer_to_req(decode_req)
+                if should_remove:
+                    indices_to_remove.add(i)
+                    if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                        self.scheduler.stream_output(
+                            [decode_req.req], decode_req.req.return_logprob
+                        )
+                        release_kv_cache(
+                            decode_req.req, self.tree_cache, is_insert=False
+                        )
+                        if self.scheduler.enable_metrics:
+                            self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+                    else:
+                        transferred_reqs.append(decode_req.req)
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,

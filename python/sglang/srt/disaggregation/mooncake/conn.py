@@ -396,15 +396,8 @@ class MooncakeKVManager(CommonKVManager):
         return (ret, False)
 
     def _prefetch_staging_reqs(self, room: int):
-        if not self.enable_staging:
+        if not self.enable_staging or self.kv_buffer_tensors is None:
             return
-        kv_buf = getattr(self, "kv_buffer_tensors", None)
-        if kv_buf is None:
-            return
-        if not hasattr(self, "_staging_requested"):
-            self._staging_requested = set()
-        if not hasattr(self, "_prefetch_sockets"):
-            self._prefetch_sockets = {}
 
         from sglang.srt.disaggregation.common.staging_handler import (
             prefetch_staging_reqs,
@@ -413,10 +406,10 @@ class MooncakeKVManager(CommonKVManager):
         prefetch_staging_reqs(
             room,
             self.transfer_infos,
-            kv_buf,
+            self.kv_buffer_tensors,
             self.server_args.chunked_prefill_size,
-            self._staging_requested,
-            self._prefetch_sockets,
+            self._staging.prefetch_requested,
+            self._staging.prefetch_sockets,
         )
 
     def send_kvcache_staged(
