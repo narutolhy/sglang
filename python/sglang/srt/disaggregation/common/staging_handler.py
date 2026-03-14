@@ -1,0 +1,631 @@
+"""
+Staging handler for heterogeneous TP KV cache transfer.
+
+This module isolates the staging scatter lifecycle management from the core
+decode and prefill transfer logic, reducing invasiveness in decode.py and
+conn.py.  Two main classes:
+
+- DecodeStagingHandler: decode-side scatter state machine
+- PrefillStagingStrategy: prefill-side staging transfer decision + execution
+"""
+
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.disaggregation.decode import DecodeRequest
+
+
+class DecodeStagingHandler:
+    """Decode-side staging scatter lifecycle manager.
+
+    Manages the full scatter lifecycle: processing CHUNK_READY messages,
+    submitting scatter kernels to a dedicated CUDA stream, tracking
+    completion via events, freeing ring-buffer allocations, and sending
+    watermark updates back to prefill.
+    """
+
+    def __init__(
+        self,
+        kv_manager,
+        staging_allocator,
+        kv_buffer_info: dict,
+        prefill_tp: int,
+        decode_tp: int,
+        total_kv_heads: int,
+        tp_rank: int,
+        scheduler,
+    ):
+        self.kv_manager = kv_manager
+        self.staging_allocator = staging_allocator
+        self.kv_buffer_info = kv_buffer_info
+        self.prefill_tp = prefill_tp
+        self.decode_tp = decode_tp
+        self.total_kv_heads = total_kv_heads
+        self.tp_rank = tp_rank
+        self.scheduler = scheduler
+
+    @classmethod
+    def try_create(cls, scheduler, tp_rank: int) -> Optional["DecodeStagingHandler"]:
+        """Factory: create handler if staging is enabled and heterogeneous TP detected."""
+        kv_manager = getattr(scheduler, "_decode_kv_manager", None)
+        if kv_manager is None:
+            return None
+        staging_allocator = getattr(kv_manager, "staging_allocator", None)
+        if staging_allocator is None:
+            return None
+        kv_buffer_info = getattr(kv_manager, "kv_buffer_tensors", None)
+        if kv_buffer_info is None:
+            return None
+        prefill_tp = getattr(kv_manager, "prefill_attn_tp_size", 0)
+        decode_tp = kv_manager.attn_tp_size
+        if prefill_tp == 0 or prefill_tp == decode_tp:
+            return None
+
+        from sglang.srt.disaggregation.common.staging import resolve_total_kv_heads
+
+        total_kv_heads = resolve_total_kv_heads(
+            kv_manager.kv_args,
+            decode_tp,
+            kv_buffer_tensors=kv_buffer_info,
+        )
+        return cls(
+            kv_manager=kv_manager,
+            staging_allocator=staging_allocator,
+            kv_buffer_info=kv_buffer_info,
+            prefill_tp=prefill_tp,
+            decode_tp=decode_tp,
+            total_kv_heads=total_kv_heads,
+            tp_rank=tp_rank,
+            scheduler=scheduler,
+        )
+
+    # ------------------------------------------------------------------
+    # Public interface used by DecodeTransferQueue.pop_transferred
+    # ------------------------------------------------------------------
+
+    def is_done(self, decode_req: "DecodeRequest") -> bool:
+        """Return True if staging scatter is complete for this request."""
+        return getattr(decode_req, "_staging_scatter_done", False)
+
+    def try_advance(self, decode_req: "DecodeRequest", queue: list) -> None:
+        """Advance LAST-SCATTER state machine for a single request.
+
+        Progresses through:
+          1. Drain pending chunk scatters
+          2. Submit LAST-SCATTER to scatter_stream (async)
+          3. Check event.query() -> if done, free watermark and mark done
+        """
+        room = decode_req.req.bootstrap_room
+        pending = getattr(self.kv_manager, "pending_chunk_scatters", {})
+
+        if room in pending and pending[room]:
+            self._process_pending_chunk_scatters(queue)
+            if room in pending and pending[room]:
+                return
+
+        if not getattr(decode_req, "_staging_last_scatter_submitted", False):
+            slot_id = self._submit_last_scatter(decode_req)
+            if slot_id >= 0:
+                scatter_stream = getattr(
+                    self.staging_allocator, "_scatter_stream", None
+                )
+                event = torch.cuda.Event()
+                if scatter_stream is not None:
+                    event.record(scatter_stream)
+                decode_req._scatter_event = event
+                decode_req._scatter_alloc_id = slot_id
+                decode_req._staging_last_scatter_submitted = True
+            else:
+                decode_req._staging_scatter_done = True
+            return
+
+        event = getattr(decode_req, "_scatter_event", None)
+        if event is not None and event.query():
+            self._free_and_send_watermark(
+                decode_req._scatter_alloc_id, decode_req
+            )
+            decode_req._scatter_event = None
+            decode_req._scatter_alloc_id = -1
+            decode_req._staging_scatter_done = True
+
+    def process_pending_chunks(self, queue: list) -> None:
+        """Process CHUNK_READY messages and submit async scatter."""
+        self._process_pending_chunk_scatters(queue)
+
+    # ------------------------------------------------------------------
+    # Internal methods (moved from DecodeTransferQueue)
+    # ------------------------------------------------------------------
+
+    def _scatter_region(
+        self,
+        staging_offset: int,
+        page_start: int,
+        num_pages: int,
+        decode_req: "DecodeRequest",
+    ) -> bool:
+        """Submit scatter kernels for a staging region to scatter_stream."""
+        from sglang.srt.disaggregation.common.staging import scatter_staging_to_kv
+
+        k_buffers = self.kv_buffer_info["k_buffers"]
+        v_buffers = self.kv_buffer_info["v_buffers"]
+        page_size = self.kv_buffer_info["page_size"]
+        dst_tp_rank = self.kv_manager.kv_args.engine_rank % self.decode_tp
+
+        req_pool_idx = decode_req.req.req_pool_idx
+        token_start = page_start * page_size
+        token_end = token_start + num_pages * page_size
+        kv_indices = self.scheduler.req_to_token_pool.req_to_token[
+            req_pool_idx, token_start:token_end
+        ]
+        if page_size > 1:
+            from sglang.srt.disaggregation.utils import kv_to_page_indices
+
+            kv_indices = kv_to_page_indices(kv_indices.cpu().numpy(), page_size)
+            page_idx_tensor = torch.from_numpy(kv_indices).to(k_buffers[0].device)
+        else:
+            page_idx_tensor = kv_indices.to(k_buffers[0].device)
+
+        staging_view = self.staging_allocator.buffer.buffer[staging_offset:]
+
+        if not hasattr(self.staging_allocator, "_scatter_stream"):
+            self.staging_allocator._scatter_stream = torch.cuda.Stream()
+
+        staging_view[0].item()
+
+        with torch.cuda.stream(self.staging_allocator._scatter_stream):
+            scatter_staging_to_kv(
+                staging_view,
+                k_buffers,
+                v_buffers,
+                page_idx_tensor,
+                page_size,
+                self.prefill_tp,
+                self.decode_tp,
+                dst_tp_rank,
+                self.total_kv_heads,
+            )
+
+        return True
+
+    def _submit_last_scatter(self, decode_req: "DecodeRequest") -> int:
+        """Submit scatter for the last chunk. Returns alloc_id >= 0, or -1."""
+        receiver = decode_req.kv_receiver
+        chunk_infos = getattr(receiver, "chunk_staging_infos", [])
+        if not chunk_infos:
+            return -1
+
+        last_info = chunk_infos[-1]
+        alloc_id, staging_offset, _, _ = last_info
+        if staging_offset < 0 or alloc_id < 0:
+            return -1
+
+        seq_len = len(decode_req.req.origin_input_ids)
+        allocator = getattr(self.scheduler, "token_to_kv_pool_allocator", None)
+        ps = allocator.page_size if allocator else 1
+        total_pages = (seq_len + ps - 1) // ps
+
+        n = len(chunk_infos)
+        prefill_cps = (
+            getattr(self.kv_manager, "prefill_chunked_prefill_size", None)
+            or self.scheduler.server_args.chunked_prefill_size
+            or 8192
+        )
+        chunk_pages = max(1, prefill_cps // ps)
+        page_start = chunk_pages * (n - 1)
+        last_num_pages = total_pages - page_start
+
+        ok = self._scatter_region(
+            staging_offset, page_start, last_num_pages, decode_req
+        )
+        return alloc_id if ok else -1
+
+    def _free_and_send_watermark(
+        self, alloc_id: int, decode_req: "DecodeRequest"
+    ) -> None:
+        """Free a staging allocation and send watermark to prefill."""
+        self.staging_allocator.free(alloc_id)
+        post_wm = self.staging_allocator.get_watermark()
+        receiver = decode_req.kv_receiver
+        if (
+            receiver is not None
+            and hasattr(receiver, "bootstrap_infos")
+            and receiver.bootstrap_infos
+        ):
+            wm_round, wm_tail = post_wm
+            session_id = getattr(receiver, "session_id", "")
+            for bootstrap_info in receiver.bootstrap_infos:
+                try:
+                    sock, lock = receiver._connect_to_bootstrap_server(
+                        bootstrap_info
+                    )
+                    with lock:
+                        sock.send_multipart(
+                            [
+                                b"WATERMARK",
+                                str(wm_round).encode("ascii"),
+                                str(wm_tail).encode("ascii"),
+                                session_id.encode("ascii"),
+                            ]
+                        )
+                except Exception:
+                    pass
+
+    def _process_pending_chunk_scatters(self, queue: list) -> None:
+        """Submit async scatter for CHUNK_READY tasks."""
+        pending = getattr(self.kv_manager, "pending_chunk_scatters", {})
+        if not pending:
+            return
+
+        num_writers = (
+            self.prefill_tp // max(1, self.decode_tp)
+            if self.prefill_tp > self.decode_tp
+            else 1
+        )
+
+        room_to_req = {
+            dr.req.bootstrap_room: dr
+            for dr in queue
+            if dr.req.bootstrap_room in pending
+        }
+
+        for room, chunks in list(pending.items()):
+            decode_req = room_to_req.get(room)
+            if decode_req is None:
+                continue
+            chunk_infos = getattr(
+                decode_req.kv_receiver, "chunk_staging_infos", []
+            )
+            if not chunk_infos:
+                continue
+
+            if not hasattr(decode_req, "_chunk_events"):
+                decode_req._chunk_events = []
+
+            by_chunk = defaultdict(list)
+            for chunk in chunks:
+                by_chunk[chunk[0]].append(chunk)
+
+            scattered_chunks = set()
+            for chunk_idx, group in by_chunk.items():
+                if chunk_idx >= len(chunk_infos):
+                    continue
+                alloc_id, staging_offset, staging_round, _ = chunk_infos[
+                    chunk_idx
+                ]
+                if staging_offset < 0:
+                    continue
+                if len(group) < num_writers:
+                    continue
+
+                page_start = group[0][1]
+                num_pages = group[0][2]
+                ok = self._scatter_region(
+                    staging_offset, page_start, num_pages, decode_req
+                )
+                if ok:
+                    scatter_stream = getattr(
+                        self.staging_allocator, "_scatter_stream", None
+                    )
+                    event = torch.cuda.Event()
+                    if scatter_stream is not None:
+                        event.record(scatter_stream)
+                    decode_req._chunk_events.append((event, alloc_id))
+                    chunk_infos[chunk_idx] = (-1, -1, 0, -1)
+                    scattered_chunks.add(chunk_idx)
+
+            if scattered_chunks:
+                chunks[:] = [c for c in chunks if c[0] not in scattered_chunks]
+
+        for decode_req in queue:
+            chunk_events = getattr(decode_req, "_chunk_events", None)
+            if not chunk_events:
+                continue
+            remaining = []
+            for event, alloc_id in chunk_events:
+                if event.query():
+                    kv_buf = getattr(self.kv_manager, "kv_buffer_tensors", None)
+                    if kv_buf is not None:
+                        torch.cuda.default_stream(
+                            kv_buf["k_buffers"][0].device
+                        ).wait_event(event)
+                    self._free_and_send_watermark(alloc_id, decode_req)
+                else:
+                    remaining.append((event, alloc_id))
+            decode_req._chunk_events = remaining
+
+
+# ======================================================================
+# Prefill-side staging transfer strategy
+# ======================================================================
+
+
+class PrefillStagingStrategy:
+    """Prefill-side staging transfer: readiness check + gather-RDMA execution.
+
+    Encapsulates the decision logic (chunk index calculation, staging offset
+    lookup, watermark readiness) and delegates actual RDMA to the kv_manager.
+    """
+
+    def __init__(self, kv_manager, staging_buffer):
+        self.kv_manager = kv_manager
+        self.staging_buffer = staging_buffer
+        page_size = kv_manager.kv_buffer_tensors["page_size"]
+        cps = kv_manager.server_args.chunked_prefill_size or 8192
+        self.full_chunk_pages = max(1, cps // page_size)
+
+    def check_ready(
+        self,
+        req,
+        kv_chunk_index_start: int,
+        num_chunk_pages: int,
+    ) -> Tuple[bool, int, int, int, int]:
+        """Check if staging offset and watermark are ready for this chunk.
+
+        Returns:
+            (ready, chunk_idx, offset, round, end)
+            If not ready, caller should re-enqueue and break.
+        """
+        chunk_idx = (
+            kv_chunk_index_start // self.full_chunk_pages
+            if self.full_chunk_pages > 0
+            else 0
+        )
+
+        if (
+            chunk_idx >= len(req.staging_offsets)
+            or req.staging_offsets[chunk_idx] < 0
+        ):
+            return (False, chunk_idx, -1, 0, -1)
+
+        c_offset = req.staging_offsets[chunk_idx]
+        c_round = req.staging_rounds[chunk_idx]
+        c_end = req.staging_ends[chunk_idx]
+
+        if not self.kv_manager._is_watermark_ready(
+            req.mooncake_session_id, c_round, c_end
+        ):
+            return (False, chunk_idx, c_offset, c_round, c_end)
+
+        return (True, chunk_idx, c_offset, c_round, c_end)
+
+    def transfer(
+        self,
+        session_id: str,
+        prefill_kv_indices,
+        dst_staging_ptr: int,
+        dst_staging_size: int,
+        target_info,
+    ) -> int:
+        """Execute staged transfer (gather + RDMA).
+
+        Returns 0 on success, -1 to signal fallback to slice path.
+        """
+        try:
+            return self.kv_manager.send_kvcache_staged(
+                session_id,
+                prefill_kv_indices,
+                dst_staging_ptr,
+                dst_staging_size,
+                target_info.dst_tp_rank,
+                target_info.dst_attn_tp_size,
+                target_info.dst_kv_item_len,
+                staging_buffer=self.staging_buffer,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"[Staging] KV transfer via staging buffer failed: {e}. "
+                f"session={session_id}"
+            ) from e
+
+
+# ======================================================================
+# Staging initialization and allocation utilities
+# (extracted from MooncakeKVManager / MooncakeKVReceiver)
+# ======================================================================
+
+
+def init_staging_buffers(engine, kv_args, count: int) -> list:
+    """Create prefill-side staging buffers and register them with the engine.
+
+    Returns list of StagingBuffer instances.
+    """
+    from sglang.srt.disaggregation.common.staging import StagingBuffer
+    from sglang.srt.disaggregation.mooncake.utils import (
+        init_mooncake_custom_mem_pool,
+    )
+    from sglang.srt.environ import envs
+
+    size_mb = envs.SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB.get()
+    size_bytes = size_mb * 1024 * 1024
+    gpu_id = kv_args.gpu_id
+    device = f"cuda:{gpu_id}"
+
+    _, custom_mem_pool, pool_type = init_mooncake_custom_mem_pool(device)
+    if custom_mem_pool is None:
+        logger.warning(
+            "No mooncake custom mem pool available for staging buffer. "
+            "NVLink transport will NOT work. Set SGLANG_MOONCAKE_CUSTOM_MEM_POOL."
+        )
+
+    buffers = []
+    for _ in range(count):
+        buf = StagingBuffer(
+            size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool
+        )
+        engine.batch_register([buf.get_ptr()], [buf.get_size()])
+        buffers.append(buf)
+    return buffers
+
+
+def init_staging_allocator(engine, kv_args):
+    """Create decode-side staging ring-buffer allocator and register with engine.
+
+    Returns a StagingAllocator instance.
+    """
+    from sglang.srt.disaggregation.common.staging import StagingAllocator
+    from sglang.srt.disaggregation.mooncake.utils import (
+        init_mooncake_custom_mem_pool,
+    )
+    from sglang.srt.environ import envs
+
+    pool_size_mb = envs.SGLANG_DISAGG_STAGING_POOL_SIZE_MB.get()
+    pool_size_bytes = pool_size_mb * 1024 * 1024
+    gpu_id = kv_args.gpu_id
+    device = f"cuda:{gpu_id}"
+
+    _, custom_mem_pool, _ = init_mooncake_custom_mem_pool(device)
+    allocator = StagingAllocator(pool_size_bytes, device, gpu_id, custom_mem_pool)
+    engine.batch_register(
+        [allocator.get_base_ptr()], [allocator.get_total_size()]
+    )
+    return allocator
+
+
+def handle_staging_req(
+    msg,
+    staging_allocator,
+    kv_args,
+    attn_tp_size: int,
+    prefill_attn_tp_size: int,
+    kv_buffer_tensors,
+    room_receivers: dict,
+    room_bootstrap: dict,
+):
+    """Allocate staging for a chunk on-demand and send STAGING_RSP to prefill.
+
+    Deduplicates: multiple prefill TP ranks may request the same
+    (room, chunk_idx) — only allocate once, return the same offset.
+    """
+    room = int(msg[1].decode("ascii"))
+    chunk_idx = int(msg[2].decode("ascii"))
+    chunk_num_pages = int(msg[3].decode("ascii"))
+    session_id = msg[4].decode("ascii")
+
+    if staging_allocator is None:
+        return
+
+    receiver = room_receivers.get(room)
+    if receiver is None:
+        return
+    infos = getattr(receiver, "chunk_staging_infos", [])
+
+    if chunk_idx < len(infos) and infos[chunk_idx][0] >= 0:
+        _, offset, rnd, end = infos[chunk_idx]
+    else:
+        from sglang.srt.disaggregation.common.staging import (
+            compute_staging_layout,
+            resolve_total_kv_heads,
+        )
+
+        page_size = kv_args.page_size
+        kv_item_lens = kv_args.kv_item_lens
+        num_kv_layers = len(kv_item_lens) // 2
+        decode_bytes_per_token = kv_item_lens[0] // page_size
+        total_kv_heads = resolve_total_kv_heads(
+            kv_args, attn_tp_size, kv_buffer_tensors=kv_buffer_tensors
+        )
+        dst_heads_per_rank = max(1, total_kv_heads // max(1, attn_tp_size))
+        bytes_per_head_per_token = decode_bytes_per_token // dst_heads_per_rank
+        dst_tp_rank = kv_args.engine_rank % max(1, attn_tp_size)
+
+        chunk_tokens = chunk_num_pages * page_size
+        _, _, required = compute_staging_layout(
+            prefill_attn_tp_size,
+            attn_tp_size,
+            dst_tp_rank,
+            total_kv_heads,
+            chunk_tokens,
+            bytes_per_head_per_token,
+            num_kv_layers,
+        )
+        result = staging_allocator.assign(required)
+        if result is None:
+            logger.warning(
+                "[STAGING_REQ] alloc failed room=%s chunk=%d", room, chunk_idx
+            )
+            return
+
+        alloc_id, offset, rnd = result
+        end = offset + required
+        while len(infos) <= chunk_idx:
+            infos.append((-1, -1, 0, -1))
+        infos[chunk_idx] = (alloc_id, offset, rnd, end)
+
+    bootstrap_infos = room_bootstrap.get(room)
+    if bootstrap_infos:
+        for bi in bootstrap_infos:
+            try:
+                sock, lock = receiver._connect_to_bootstrap_server(bi)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            b"STAGING_RSP",
+                            str(room).encode("ascii"),
+                            str(chunk_idx).encode("ascii"),
+                            str(offset).encode("ascii"),
+                            str(rnd).encode("ascii"),
+                            str(end).encode("ascii"),
+                            session_id.encode("ascii"),
+                        ]
+                    )
+            except Exception:
+                pass
+
+
+def allocate_chunk_staging_for_receiver(kv_mgr, kv_indices) -> list:
+    """Allocate per-chunk staging regions from the ring buffer allocator.
+
+    Extracted from MooncakeKVReceiver._allocate_chunk_staging.
+    Returns list of (alloc_id, offset, round, end) per chunk.
+    """
+    staging_allocator = getattr(kv_mgr, "staging_allocator", None)
+    if staging_allocator is None:
+        return []
+
+    from sglang.srt.disaggregation.common.staging import (
+        allocate_chunk_staging,
+        resolve_total_kv_heads,
+    )
+
+    page_size = kv_mgr.kv_args.page_size
+    kv_item_lens = kv_mgr.kv_args.kv_item_lens
+    num_kv_layers = len(kv_item_lens) // 2
+    decode_bytes_per_token = kv_item_lens[0] // page_size
+    attn_tp_size = kv_mgr.attn_tp_size
+    prefill_attn_tp = getattr(kv_mgr, "prefill_attn_tp_size", attn_tp_size)
+    total_kv_heads = resolve_total_kv_heads(
+        kv_mgr.kv_args,
+        attn_tp_size,
+        kv_buffer_tensors=getattr(kv_mgr, "kv_buffer_tensors", None),
+    )
+    dst_heads_per_rank = max(1, total_kv_heads // max(1, attn_tp_size))
+    bytes_per_head_per_token = decode_bytes_per_token // dst_heads_per_rank
+    dst_tp_rank = kv_mgr.kv_args.engine_rank % max(1, attn_tp_size)
+
+    chunked_prefill_size = (
+        getattr(kv_mgr, "prefill_chunked_prefill_size", None)
+        or kv_mgr.server_args.chunked_prefill_size
+        or 8192
+    )
+    chunk_pages = max(1, chunked_prefill_size // page_size)
+
+    return allocate_chunk_staging(
+        staging_allocator,
+        len(kv_indices),
+        page_size,
+        chunk_pages,
+        prefill_attn_tp,
+        attn_tp_size,
+        dst_tp_rank,
+        total_kv_heads,
+        bytes_per_head_per_token,
+        num_kv_layers,
+    )

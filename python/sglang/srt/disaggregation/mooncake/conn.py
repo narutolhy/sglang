@@ -271,89 +271,20 @@ class MooncakeKVManager(CommonKVManager):
         self._room_receivers[room] = receiver
 
     def _handle_staging_req(self, msg):
-        """Allocate staging for a chunk on-demand and send STAGING_RSP to prefill.
+        from sglang.srt.disaggregation.common.staging_handler import (
+            handle_staging_req,
+        )
 
-        Deduplicates: multiple prefill TP ranks may request the same
-        (room, chunk_idx) — only allocate once, return the same offset.
-        """
-        room = int(msg[1].decode("ascii"))
-        chunk_idx = int(msg[2].decode("ascii"))
-        chunk_num_pages = int(msg[3].decode("ascii"))
-        session_id = msg[4].decode("ascii")
-
-        if self.staging_allocator is None:
-            return
-
-        receiver = self._room_receivers.get(room)
-        if receiver is None:
-            return
-        infos = getattr(receiver, "chunk_staging_infos", [])
-
-        if chunk_idx < len(infos) and infos[chunk_idx][0] >= 0:
-            _, offset, rnd, end = infos[chunk_idx]
-        else:
-            from sglang.srt.disaggregation.common.staging import (
-                compute_staging_layout,
-                resolve_total_kv_heads,
-            )
-
-            page_size = self.kv_args.page_size
-            kv_item_lens = self.kv_args.kv_item_lens
-            num_kv_layers = len(kv_item_lens) // 2
-            decode_bytes_per_token = kv_item_lens[0] // page_size
-            attn_tp_size = self.attn_tp_size
-            prefill_attn_tp = getattr(self, "prefill_attn_tp_size", attn_tp_size)
-            total_kv_heads = resolve_total_kv_heads(
-                self.kv_args,
-                attn_tp_size,
-                kv_buffer_tensors=getattr(self, "kv_buffer_tensors", None),
-            )
-            dst_heads_per_rank = max(1, total_kv_heads // max(1, attn_tp_size))
-            bytes_per_head_per_token = decode_bytes_per_token // dst_heads_per_rank
-            dst_tp_rank = self.kv_args.engine_rank % max(1, attn_tp_size)
-
-            chunk_tokens = chunk_num_pages * page_size
-            _, _, required = compute_staging_layout(
-                prefill_attn_tp,
-                attn_tp_size,
-                dst_tp_rank,
-                total_kv_heads,
-                chunk_tokens,
-                bytes_per_head_per_token,
-                num_kv_layers,
-            )
-            result = self.staging_allocator.assign(required)
-            if result is None:
-                logger.warning(
-                    "[STAGING_REQ] alloc failed room=%s chunk=%d", room, chunk_idx
-                )
-                return
-
-            alloc_id, offset, rnd = result
-            end = offset + required
-            while len(infos) <= chunk_idx:
-                infos.append((-1, -1, 0, -1))
-            infos[chunk_idx] = (alloc_id, offset, rnd, end)
-
-        bootstrap_infos = self._room_bootstrap.get(room)
-        if bootstrap_infos:
-            for bi in bootstrap_infos:
-                try:
-                    sock, lock = receiver._connect_to_bootstrap_server(bi)
-                    with lock:
-                        sock.send_multipart(
-                            [
-                                b"STAGING_RSP",
-                                str(room).encode("ascii"),
-                                str(chunk_idx).encode("ascii"),
-                                str(offset).encode("ascii"),
-                                str(rnd).encode("ascii"),
-                                str(end).encode("ascii"),
-                                session_id.encode("ascii"),
-                            ]
-                        )
-                except Exception:
-                    pass
+        handle_staging_req(
+            msg,
+            self.staging_allocator,
+            self.kv_args,
+            self.attn_tp_size,
+            getattr(self, "prefill_attn_tp_size", self.attn_tp_size),
+            getattr(self, "kv_buffer_tensors", None),
+            self._room_receivers,
+            self._room_bootstrap,
+        )
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -378,55 +309,19 @@ class MooncakeKVManager(CommonKVManager):
             )
 
     def _init_staging_buffers(self, count: int):
-        from sglang.srt.disaggregation.common.staging import StagingBuffer
-        from sglang.srt.disaggregation.mooncake.utils import (
-            init_mooncake_custom_mem_pool,
+        from sglang.srt.disaggregation.common.staging_handler import (
+            init_staging_buffers,
         )
 
-        size_mb = envs.SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB.get()
-        size_bytes = size_mb * 1024 * 1024
-        gpu_id = self.kv_args.gpu_id
-        device = f"cuda:{gpu_id}"
-
-        _, custom_mem_pool, pool_type = init_mooncake_custom_mem_pool(device)
-        if custom_mem_pool is None:
-            logger.warning(
-                "No mooncake custom mem pool available for staging buffer. "
-                "NVLink transport will NOT work. Set SGLANG_MOONCAKE_CUSTOM_MEM_POOL."
-            )
-        for i in range(count):
-            buf = StagingBuffer(
-                size_bytes,
-                device,
-                gpu_id,
-                custom_mem_pool=custom_mem_pool,
-            )
-            self.engine.batch_register([buf.get_ptr()], [buf.get_size()])
-            self.staging_buffers.append(buf)
+        self.staging_buffers = init_staging_buffers(self.engine, self.kv_args, count)
         self.kv_buffer_tensors = None
 
     def _init_staging_allocator(self):
-        from sglang.srt.disaggregation.common.staging import StagingAllocator
-        from sglang.srt.disaggregation.mooncake.utils import (
-            init_mooncake_custom_mem_pool,
+        from sglang.srt.disaggregation.common.staging_handler import (
+            init_staging_allocator,
         )
 
-        pool_size_mb = envs.SGLANG_DISAGG_STAGING_POOL_SIZE_MB.get()
-        pool_size_bytes = pool_size_mb * 1024 * 1024
-        gpu_id = self.kv_args.gpu_id
-        device = f"cuda:{gpu_id}"
-
-        _, custom_mem_pool, _ = init_mooncake_custom_mem_pool(device)
-        self.staging_allocator = StagingAllocator(
-            pool_size_bytes,
-            device,
-            gpu_id,
-            custom_mem_pool,
-        )
-        self.engine.batch_register(
-            [self.staging_allocator.get_base_ptr()],
-            [self.staging_allocator.get_total_size()],
-        )
+        self.staging_allocator = init_staging_allocator(self.engine, self.kv_args)
         self.kv_buffer_tensors = None
 
     def set_kv_buffer_tensors(self, k_buffers: list, v_buffers: list, page_size: int):
@@ -1087,6 +982,15 @@ class MooncakeKVManager(CommonKVManager):
         staging_buffer=None,
         worker_id: int = 0,
     ):
+        staging_strategy = None
+        if staging_buffer is not None and self.enable_staging:
+            from sglang.srt.disaggregation.common.staging_handler import (
+                PrefillStagingStrategy,
+            )
+
+            if getattr(self, "kv_buffer_tensors", None) is not None:
+                staging_strategy = PrefillStagingStrategy(self, staging_buffer)
+
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
@@ -1140,19 +1044,14 @@ class MooncakeKVManager(CommonKVManager):
                             or self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         )
-                        worker_can_stage = (
-                            self.enable_staging
-                            and staging_buffer is not None
-                            and getattr(self, "kv_buffer_tensors", None) is not None
-                        )
                         use_staging = (
                             not tp_match
-                            and worker_can_stage
+                            and staging_strategy is not None
                             and target_rank_registration_info.dst_staging_base_ptr > 0
                         )
                         if not use_staging and not tp_match:
                             logger.warning_once(
-                                f"[Staging] Fallback to slice for heterogeneous TP transfer"
+                                "[Staging] Fallback to slice for heterogeneous TP transfer"
                             )
                         if tp_match:
                             ret = self.send_kvcache(
@@ -1163,59 +1062,25 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                             )
                         elif use_staging:
-                            page_size = self.kv_buffer_tensors["page_size"]
-                            cps = self.server_args.chunked_prefill_size or 8192
-                            full_chunk_pages = max(1, cps // page_size)
-                            chunk_pages = len(kv_chunk.prefill_kv_indices)
-                            chunk_idx = (
-                                kv_chunk.index_slice.start // full_chunk_pages
-                                if full_chunk_pages > 0
-                                else 0
-                            )
-
-                            if (
-                                chunk_idx >= len(req.staging_offsets)
-                                or req.staging_offsets[chunk_idx] < 0
-                            ):
-                                queue.put(kv_chunk)
-                                watermark_deferred = True
-                                break
-
-                            c_offset = req.staging_offsets[chunk_idx]
-                            c_round = req.staging_rounds[chunk_idx]
-                            c_end = req.staging_ends[chunk_idx]
-
-                            if not self._is_watermark_ready(
-                                req.mooncake_session_id, c_round, c_end
-                            ):
-                                queue.put(kv_chunk)
-                                watermark_deferred = True
-                                break
-
-                            dst_staging_ptr = (
-                                target_rank_registration_info.dst_staging_base_ptr
-                                + c_offset
-                            )
-                            dst_staging_size = (
-                                target_rank_registration_info.dst_staging_total_size
-                                - c_offset
-                            )
-                            try:
-                                ret = self.send_kvcache_staged(
-                                    req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
-                                    dst_staging_ptr,
-                                    dst_staging_size,
-                                    target_rank_registration_info.dst_tp_rank,
-                                    target_rank_registration_info.dst_attn_tp_size,
-                                    target_rank_registration_info.dst_kv_item_len,
-                                    staging_buffer=staging_buffer,
+                            ready, chunk_idx, c_offset, c_round, c_end = (
+                                staging_strategy.check_ready(
+                                    req,
+                                    kv_chunk.index_slice.start,
+                                    len(kv_chunk.prefill_kv_indices),
                                 )
-                            except Exception as staging_err:
-                                raise RuntimeError(
-                                    f"[Staging] KV transfer via staging buffer failed: {staging_err}. "
-                                    f"room={kv_chunk.room}, session={req.mooncake_session_id}"
-                                ) from staging_err
+                            )
+                            if not ready:
+                                queue.put(kv_chunk)
+                                watermark_deferred = True
+                                break
+
+                            ret = staging_strategy.transfer(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_staging_base_ptr + c_offset,
+                                target_rank_registration_info.dst_staging_total_size - c_offset,
+                                target_rank_registration_info,
+                            )
                             if ret == -1:
                                 logger.warning(
                                     f"[Staging] Falling back to per-token slice path "
@@ -1846,52 +1711,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 )
 
     def _allocate_chunk_staging(self, kv_indices):
-        """Allocate per-chunk staging regions from the ring buffer allocator."""
-        staging_allocator = getattr(self.kv_mgr, "staging_allocator", None)
-        if staging_allocator is None:
-            return []
-
-        from sglang.srt.disaggregation.common.staging import (
-            allocate_chunk_staging,
-            resolve_total_kv_heads,
+        from sglang.srt.disaggregation.common.staging_handler import (
+            allocate_chunk_staging_for_receiver,
         )
 
-        page_size = self.kv_mgr.kv_args.page_size
-        kv_item_lens = self.kv_mgr.kv_args.kv_item_lens
-        num_kv_layers = len(kv_item_lens) // 2
-        decode_bytes_per_token = kv_item_lens[0] // page_size
-        attn_tp_size = self.kv_mgr.attn_tp_size
-        prefill_attn_tp = getattr(self.kv_mgr, "prefill_attn_tp_size", attn_tp_size)
-        total_kv_heads = resolve_total_kv_heads(
-            self.kv_mgr.kv_args,
-            attn_tp_size,
-            kv_buffer_tensors=getattr(self.kv_mgr, "kv_buffer_tensors", None),
-        )
-        dst_heads_per_rank = max(1, total_kv_heads // max(1, attn_tp_size))
-        bytes_per_head_per_token = decode_bytes_per_token // dst_heads_per_rank
-        dst_tp_rank = self.kv_mgr.kv_args.engine_rank % max(1, attn_tp_size)
-
-        chunked_prefill_size = (
-            getattr(self.kv_mgr, "prefill_chunked_prefill_size", None)
-            or self.kv_mgr.server_args.chunked_prefill_size
-            or 8192
-        )
-        chunk_pages = max(1, chunked_prefill_size // page_size)
-
-        result = allocate_chunk_staging(
-            staging_allocator,
-            len(kv_indices),
-            page_size,
-            chunk_pages,
-            prefill_attn_tp,
-            attn_tp_size,
-            dst_tp_rank,
-            total_kv_heads,
-            bytes_per_head_per_token,
-            num_kv_layers,
-        )
-
-        return result
+        return allocate_chunk_staging_for_receiver(self.kv_mgr, kv_indices)
 
     def init(
         self,
