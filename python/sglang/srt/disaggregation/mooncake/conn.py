@@ -314,9 +314,7 @@ class MooncakeKVManager(CommonKVManager):
         return is_watermark_ready(self._staging, session_id, alloc_round, alloc_end)
 
     def _try_create_staging_strategy(self, staging_buffer):
-        if not self.enable_staging:
-            return None
-        if getattr(self, "kv_buffer_tensors", None) is None:
+        if not self.enable_staging or self.kv_buffer_tensors is None:
             return None
         from sglang.srt.disaggregation.common.staging_handler import (
             PrefillStagingStrategy,
@@ -345,17 +343,19 @@ class MooncakeKVManager(CommonKVManager):
             pass
 
     def _do_staging_transfer(self, staging_strategy, kv_chunk, req,
-                             target_info, chunked_dst_kv_indice, executor, queue):
-        """Execute staging transfer for one chunk. Returns (ret, chunk_idx, deferred).
+                             target_info, chunked_dst_kv_indice, executor,
+                             queue, local_rank):
+        """Execute staging transfer for one chunk. Returns (ret, deferred).
 
+        Handles readiness check, transfer, fallback, and CHUNK_READY notification.
         deferred=True means caller should re-enqueue and break.
         """
-        ready, chunk_idx, c_offset, c_round, c_end = staging_strategy.check_ready(
+        ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
             req, kv_chunk.index_slice.start, len(kv_chunk.prefill_kv_indices),
         )
         if not ready:
             queue.put(kv_chunk)
-            return (-1, chunk_idx, True)
+            return (-1, True)
 
         ret = staging_strategy.transfer(
             req.mooncake_session_id,
@@ -378,7 +378,9 @@ class MooncakeKVManager(CommonKVManager):
                 target_info.dst_kv_item_len,
                 executor,
             )
-        return (ret, chunk_idx, False)
+        elif ret == 0 and not kv_chunk.is_last:
+            self._send_chunk_ready(req, chunk_idx, kv_chunk, local_rank)
+        return (ret, False)
 
     def _prefetch_staging_reqs(self, room: int):
         if not self.enable_staging:
@@ -1047,6 +1049,10 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                if staging_strategy is None and staging_buffer is not None:
+                    staging_strategy = self._try_create_staging_strategy(
+                        staging_buffer
+                    )
                 reqs_to_be_processed = (
                     self.transfer_infos[kv_chunk.room].values()
                     if kv_chunk.room in self.transfer_infos
@@ -1092,26 +1098,10 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        tp_match = (
-                            self.is_mla_backend
-                            or self.attn_tp_size
+                        if self.is_mla_backend or (
+                            self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
-                        )
-                        if staging_strategy is None and staging_buffer is not None:
-                            staging_strategy = self._try_create_staging_strategy(
-                                staging_buffer
-                            )
-                        use_staging = (
-                            not tp_match
-                            and staging_strategy is not None
-                            and target_rank_registration_info.staging is not None
-                            and target_rank_registration_info.staging.base_ptr > 0
-                        )
-                        if not use_staging and not tp_match:
-                            logger.warning_once(
-                                "[Staging] Fallback to slice for heterogeneous TP transfer"
-                            )
-                        if tp_match:
+                        ):
                             ret = self.send_kvcache(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
@@ -1119,11 +1109,15 @@ class MooncakeKVManager(CommonKVManager):
                                 chunked_dst_kv_indice,
                                 executor,
                             )
-                        elif use_staging:
-                            ret, chunk_idx, deferred = self._do_staging_transfer(
+                        elif (
+                            staging_strategy is not None
+                            and target_rank_registration_info.staging is not None
+                        ):
+                            ret, deferred = self._do_staging_transfer(
                                 staging_strategy, kv_chunk, req,
                                 target_rank_registration_info,
                                 chunked_dst_kv_indice, executor, queue,
+                                local_rank,
                             )
                             if deferred:
                                 watermark_deferred = True
@@ -1161,11 +1155,6 @@ class MooncakeKVManager(CommonKVManager):
                                 local_rank,
                             )
                             break
-
-                        if use_staging and not kv_chunk.is_last and ret == 0:
-                            self._send_chunk_ready(
-                                req, chunk_idx, kv_chunk, local_rank
-                            )
 
                         if kv_chunk.is_last:
                             if kv_chunk.state_indices is not None:
@@ -1205,19 +1194,12 @@ class MooncakeKVManager(CommonKVManager):
                 if watermark_deferred:
                     continue
 
-                pending_counts = getattr(self, "_pending_chunk_count", {})
-                room_key = kv_chunk.room
-                cnt = pending_counts.get(room_key, 0) - 1
-                if cnt <= 0:
-                    pending_counts.pop(room_key, None)
-                    if (
-                        room_key not in self.request_status
-                        or self.check_status(room_key) == KVPoll.Success
-                    ):
-                        if room_key in self.transfer_infos:
-                            self.transfer_infos.pop(room_key)
-                else:
-                    pending_counts[room_key] = cnt
+                if (
+                    kv_chunk.room not in self.request_status
+                    or self.check_status(kv_chunk.room) == KVPoll.Success
+                ):
+                    if kv_chunk.room in self.transfer_infos:
+                        self.transfer_infos.pop(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -1432,12 +1414,6 @@ class MooncakeKVManager(CommonKVManager):
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
-
-        if not hasattr(self, "_pending_chunk_count"):
-            self._pending_chunk_count = {}
-        self._pending_chunk_count[bootstrap_room] = (
-            self._pending_chunk_count.get(bootstrap_room, 0) + 1
-        )
 
         chunk = TransferKVChunk(
             room=bootstrap_room,
