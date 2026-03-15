@@ -373,7 +373,7 @@ class MooncakeKVManager(CommonKVManager):
             len(kv_chunk.prefill_kv_indices),
         )
         if not ready:
-            from sglang.srt.disaggregation.common.staging import StagingAllocator
+            from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
 
             if c_offset == StagingAllocator.ALLOC_OVERSIZED:
                 raise RuntimeError(
@@ -438,7 +438,7 @@ class MooncakeKVManager(CommonKVManager):
         staging_buffer=None,
     ) -> int:
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
-        from sglang.srt.disaggregation.common.staging import (
+        from sglang.srt.disaggregation.common.staging_buffer import (
             compute_head_slice_params,
             compute_staging_layout,
             resolve_total_kv_heads,
@@ -494,7 +494,7 @@ class MooncakeKVManager(CommonKVManager):
             )
             return -1
 
-        from sglang.srt.disaggregation.common.staging import (
+        from sglang.srt.disaggregation.common.staging_buffer import (
             gather_all_layers_to_staging,
         )
 
