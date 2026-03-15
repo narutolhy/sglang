@@ -80,6 +80,9 @@ class StagingAllocator:
     overlaps with not-yet-freed data from a previous round.
     """
 
+    # Permanent alloc failure: chunk exceeds ring buffer total size.
+    ALLOC_OVERSIZED = -2
+
     def __init__(
         self,
         total_size_bytes: int,
@@ -106,11 +109,7 @@ class StagingAllocator:
         )
 
     def assign(self, required_bytes: int) -> Optional[Tuple[int, int, int]]:
-        """Allocate a region. Returns (alloc_id, offset, round) or None.
-
-        Overcommit: does not check overlap. Prefill side checks watermark
-        before RDMA to ensure the region is safe to write.
-        """
+        """Allocate a region. Returns (alloc_id, offset, round) or None."""
         with self.lock:
             if required_bytes > self.total_size:
                 return None
@@ -249,11 +248,7 @@ def gather_all_layers_to_staging(
 ) -> int:
     """Gather all layers' K and V head slices into a staging buffer.
 
-    All GPU operations (set_device, tensor creation, gather, synchronize)
-    are encapsulated here so callers don't need to import torch.
-
-    Returns:
-        Total bytes written to staging buffer.
+    Returns total bytes written.
     """
     import numpy as np
 
@@ -325,12 +320,7 @@ def scatter_staging_to_kv(
     dst_tp_rank: int,
     total_kv_heads: int,
 ) -> None:
-    """Scatter data from a contiguous staging region into KV cache buffers.
-
-    This is backend-agnostic: it only performs GPU scatter operations.
-    The caller is responsible for resolving page indices, ensuring
-    the staging data is visible on GPU, and selecting the CUDA stream.
-    """
+    """Scatter data from a contiguous staging region into KV cache buffers."""
     num_layers = len(k_buffers)
     head_dim = k_buffers[0].shape[-1]
     dtype_size = k_buffers[0].element_size()
@@ -467,11 +457,7 @@ def allocate_chunk_staging(
 ) -> List[Tuple[int, int, int, int]]:
     """Allocate per-chunk staging regions from a StagingAllocator.
 
-    Splits total_pages into chunks of chunk_pages, computes the required staging
-    bytes per chunk via compute_staging_layout, and assigns from the allocator.
-
     Returns list of (alloc_id, offset, round, end) per chunk.
-    Failed allocations are recorded as (-1, -1, 0, -1).
     """
     infos: List[Tuple[int, int, int, int]] = []
     remaining = num_pages
@@ -492,10 +478,13 @@ def allocate_chunk_staging(
             alloc_id, offset, rnd = result
             infos.append((alloc_id, offset, rnd, offset + required))
         else:
-            logger.warning_once(
-                f"[Staging] allocator returned None for chunk: need {required} bytes"
+            logger.error(
+                "[Staging] allocator returned None: need %d bytes, "
+                "buffer total=%d bytes. Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB.",
+                required,
+                allocator.total_size,
             )
-            infos.append((-1, -1, 0, -1))
+            infos.append((-1, StagingAllocator.ALLOC_OVERSIZED, 0, -1))
         remaining -= cp
     return infos
 
@@ -503,29 +492,16 @@ def allocate_chunk_staging(
 def resolve_total_kv_heads(
     kv_args,
     attn_tp_size: int,
-    kv_buffer_tensors=None,
 ) -> int:
-    """Resolve the global total KV head count from available metadata.
-
-    Tries in order: kv_args.total_kv_head_num, kv_args.kv_head_num * attn_tp_size,
-    kv_buffer_tensors shape.  Raises if none are available.
-    """
+    """Resolve the global total KV head count from kv_args metadata."""
     total = getattr(kv_args, "total_kv_head_num", 0)
     if total > 0:
         return total
     per_rank = getattr(kv_args, "kv_head_num", 0)
     if per_rank > 0:
         return per_rank * attn_tp_size
-    if kv_buffer_tensors is not None:
-        k_bufs = (
-            kv_buffer_tensors.get("k_buffers")
-            if isinstance(kv_buffer_tensors, dict)
-            else None
-        )
-        if k_bufs and len(k_bufs) > 0:
-            return int(k_bufs[0].shape[1]) * max(1, attn_tp_size)
     raise ValueError(
         "Cannot resolve total_kv_heads: kv_args has neither total_kv_head_num "
-        "nor kv_head_num, and no kv_buffer_tensors provided. "
+        "nor kv_head_num. "
         "Ensure DecodePreallocQueue._init_kv_manager sets kv_args.kv_head_num."
     )

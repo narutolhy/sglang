@@ -373,6 +373,14 @@ class MooncakeKVManager(CommonKVManager):
             len(kv_chunk.prefill_kv_indices),
         )
         if not ready:
+            from sglang.srt.disaggregation.common.staging import StagingAllocator
+
+            if c_offset == StagingAllocator.ALLOC_OVERSIZED:
+                raise RuntimeError(
+                    f"[Staging] Chunk staging allocation permanently failed: "
+                    f"chunk exceeds ring buffer total size (room={kv_chunk.room}). "
+                    f"Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
+                )
             queue.put(kv_chunk)
             return (-1, True)
 
