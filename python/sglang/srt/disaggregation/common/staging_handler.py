@@ -92,7 +92,7 @@ class DecodeStagingHandler:
         if prefill_tp == 0 or prefill_tp == decode_tp:
             return None
 
-        from sglang.srt.disaggregation.common.staging import resolve_total_kv_heads
+        from sglang.srt.disaggregation.common.staging_buffer import resolve_total_kv_heads
 
         total_kv_heads = resolve_total_kv_heads(kv_manager.kv_args, decode_tp)
         return cls(
@@ -165,7 +165,7 @@ class DecodeStagingHandler:
         decode_req: "DecodeRequest",
     ) -> bool:
         """Submit scatter kernels for a staging region to scatter_stream."""
-        from sglang.srt.disaggregation.common.staging import scatter_staging_to_kv
+        from sglang.srt.disaggregation.common.staging_buffer import scatter_staging_to_kv
 
         k_buffers = self.kv_buffer_info["k_buffers"]
         v_buffers = self.kv_buffer_info["v_buffers"]
@@ -356,7 +356,7 @@ def allocate_chunk_staging_for_receiver(kv_mgr, kv_indices) -> list:
     if staging_allocator is None:
         return []
 
-    from sglang.srt.disaggregation.common.staging import (
+    from sglang.srt.disaggregation.common.staging_buffer import (
         allocate_chunk_staging,
         resolve_total_kv_heads,
     )
@@ -488,7 +488,7 @@ class PrefillStagingStrategy:
         offset == ALLOC_OVERSIZED means permanent failure (fall back to slice).
         offset == -1 means allocation pending (re-enqueue).
         """
-        from sglang.srt.disaggregation.common.staging import StagingAllocator
+        from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
 
         chunk_idx = (
             kv_chunk_index_start // self.full_chunk_pages
@@ -551,7 +551,7 @@ def init_staging_buffers(engine, kv_args, count: int) -> list:
 
     Returns list of StagingBuffer instances.
     """
-    from sglang.srt.disaggregation.common.staging import StagingBuffer
+    from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
     from sglang.srt.disaggregation.mooncake.utils import (
         init_mooncake_custom_mem_pool,
     )
@@ -582,7 +582,7 @@ def init_staging_allocator(engine, kv_args):
 
     Returns a StagingAllocator instance.
     """
-    from sglang.srt.disaggregation.common.staging import StagingAllocator
+    from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
     from sglang.srt.disaggregation.mooncake.utils import (
         init_mooncake_custom_mem_pool,
     )
@@ -614,7 +614,7 @@ def handle_staging_req(
     Deduplicates: multiple prefill TP ranks requesting the same (room, chunk_idx)
     only allocate once.  Sends ALLOC_OVERSIZED on permanent failure.
     """
-    from sglang.srt.disaggregation.common.staging import StagingAllocator
+    from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
 
     room = int(msg[1].decode("ascii"))
     chunk_idx = int(msg[2].decode("ascii"))
@@ -637,7 +637,7 @@ def handle_staging_req(
     ):
         offset, rnd, end = StagingAllocator.ALLOC_OVERSIZED, 0, -1
     else:
-        from sglang.srt.disaggregation.common.staging import (
+        from sglang.srt.disaggregation.common.staging_buffer import (
             compute_staging_layout,
             resolve_total_kv_heads,
         )
