@@ -20,6 +20,50 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _fused_gather_to_staging_kernel(
+        layer_ptrs,
+        page_indices,
+        staging,
+        num_tokens,
+        stride_pool_token,
+        head_offset,
+        per_layer_elems,
+        ELEMS_PER_TOKEN: tl.constexpr,
+        PAGE_SIZE: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        layer_id = tl.program_id(0)
+        block_id = tl.program_id(1)
+
+        # Cast loaded address to same pointer type as staging (dtype-agnostic)
+        layer_ptr = tl.load(layer_ptrs + layer_id).to(staging.dtype)
+
+        offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < per_layer_elems
+
+        t_idx = offsets // ELEMS_PER_TOKEN
+        e_idx = offsets % ELEMS_PER_TOKEN
+
+        page_id = t_idx // PAGE_SIZE
+        intra_page = t_idx % PAGE_SIZE
+        page_val = tl.load(page_indices + page_id, mask=mask, other=0)
+        pool_token = page_val * PAGE_SIZE + intra_page
+
+        src_offsets = pool_token * stride_pool_token.to(tl.int64) + head_offset.to(tl.int64) + e_idx
+        vals = tl.load(layer_ptr + src_offsets, mask=mask)
+
+        dst_offsets = tl.program_id(0).to(tl.int64) * per_layer_elems.to(tl.int64) + offsets
+        tl.store(staging + dst_offsets, vals, mask=mask)
+
+    _TRITON_AVAILABLE = True
+except ImportError:
+    _TRITON_AVAILABLE = False
+
 
 class StagingBuffer:
     """Pre-allocated GPU staging buffer for bulk KV transfer.
@@ -173,36 +217,26 @@ class StagingAllocator:
 
 def gather_kv_head_slices(
     kv_buffer_tensor: torch.Tensor,
-    page_indices: torch.Tensor,
+    gather_idx: torch.Tensor,
     head_start: int,
     num_heads: int,
     staging_tensor: torch.Tensor,
-    page_size: int = 1,
 ):
     """Gather KV head slices from scattered pages into contiguous staging buffer.
 
+    Uses torch.gather(out=) to write directly into staging_tensor without
+    allocating temporary tensors (avoids CUDA caching allocator stalls).
+
     Args:
-        kv_buffer_tensor: The KV buffer for one layer, shape [pool_size, head_num, head_dim].
-            The buffer is always 3D. When page_size > 1, each page occupies
-            page_size consecutive slots in the first dimension.
-        page_indices: [num_pages] int32/int64 tensor of page indices.
+        kv_buffer_tensor: [pool_size, head_num, head_dim], one layer.
+        gather_idx: [num_tokens, num_heads, head_dim] int64, pre-computed
+            token indices expanded for gather on dim=0.
         head_start: Starting head index for the slice.
         num_heads: Number of heads to gather.
-        staging_tensor: Output tensor, contiguous, matching the gathered shape.
-        page_size: Number of tokens per page.
+        staging_tensor: Output tensor, shape [num_tokens, num_heads, head_dim].
     """
-    if page_size == 1:
-        selected = kv_buffer_tensor[
-            page_indices, head_start : head_start + num_heads, :
-        ]
-        staging_tensor.copy_(selected.reshape(staging_tensor.shape))
-    else:
-        offsets = torch.arange(page_size, device=page_indices.device)
-        token_indices = (page_indices.unsqueeze(1) * page_size + offsets).reshape(-1)
-        selected = kv_buffer_tensor[
-            token_indices, head_start : head_start + num_heads, :
-        ]
-        staging_tensor.copy_(selected.reshape(staging_tensor.shape))
+    src = kv_buffer_tensor[:, head_start : head_start + num_heads, :]
+    torch.gather(src, 0, gather_idx, out=staging_tensor)
 
 
 def scatter_kv_head_slices(
@@ -236,6 +270,145 @@ def scatter_kv_head_slices(
         kv_buffer_tensor[token_indices, head_start : head_start + num_heads, :] = data
 
 
+def _gather_all_layers_torch(
+    k_buffers: list,
+    v_buffers: list,
+    page_indices_np,
+    staging_buffer: StagingBuffer,
+    src_head_start: int,
+    num_heads: int,
+    page_size: int,
+    gpu_id: int,
+) -> int:
+    """torch.gather path: zero per-layer allocation, one kernel per layer."""
+    import numpy as np
+
+    num_layers = len(k_buffers)
+    head_dim = k_buffers[0].shape[-1]
+    dtype_size = k_buffers[0].element_size()
+    num_tokens = len(page_indices_np) * page_size
+    per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
+
+    device = f"cuda:{gpu_id}"
+    torch.cuda.set_device(gpu_id)
+    page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(device)
+
+    if page_size == 1:
+        token_indices = page_idx_tensor
+    else:
+        offsets = torch.arange(page_size, device=device)
+        token_indices = (page_idx_tensor.unsqueeze(1) * page_size + offsets).reshape(-1)
+
+    gather_idx = token_indices.view(-1, 1, 1).expand(num_tokens, num_heads, head_dim)
+
+    if not hasattr(staging_buffer, "_gather_stream"):
+        staging_buffer._gather_stream = torch.cuda.Stream(device=device)
+
+    staging_buffer._gather_stream.wait_stream(
+        torch.cuda.default_stream(torch.device(device))
+    )
+
+    staging_view = staging_buffer.buffer
+    offset = 0
+    with torch.cuda.stream(staging_buffer._gather_stream):
+        for layer_id in range(num_layers):
+            dst = (
+                staging_view[offset : offset + per_layer_bytes]
+                .view(k_buffers[layer_id].dtype)
+                .reshape(num_tokens, num_heads, head_dim)
+            )
+            gather_kv_head_slices(
+                k_buffers[layer_id],
+                gather_idx,
+                src_head_start,
+                num_heads,
+                dst,
+            )
+            offset += per_layer_bytes
+        for layer_id in range(num_layers):
+            dst = (
+                staging_view[offset : offset + per_layer_bytes]
+                .view(v_buffers[layer_id].dtype)
+                .reshape(num_tokens, num_heads, head_dim)
+            )
+            gather_kv_head_slices(
+                v_buffers[layer_id],
+                gather_idx,
+                src_head_start,
+                num_heads,
+                dst,
+            )
+            offset += per_layer_bytes
+
+    staging_buffer._gather_stream.synchronize()
+    return offset
+
+
+def _gather_all_layers_triton(
+    k_buffers: list,
+    v_buffers: list,
+    page_indices_np,
+    staging_buffer: StagingBuffer,
+    src_head_start: int,
+    num_heads: int,
+    page_size: int,
+    gpu_id: int,
+) -> int:
+    """Triton fused kernel path: single kernel launch for all layers."""
+    import numpy as np
+
+    num_layers = len(k_buffers)
+    head_dim = k_buffers[0].shape[-1]
+    total_heads = k_buffers[0].shape[1]
+    dtype_size = k_buffers[0].element_size()
+    num_tokens = len(page_indices_np) * page_size
+    elems_per_token = num_heads * head_dim
+    per_layer_elems = num_tokens * elems_per_token
+    per_layer_bytes = per_layer_elems * dtype_size
+    total_bytes = per_layer_bytes * num_layers * 2
+
+    device = f"cuda:{gpu_id}"
+    torch.cuda.set_device(gpu_id)
+    page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(device)
+
+    layer_ptrs = torch.tensor(
+        [buf.data_ptr() for buf in k_buffers] + [buf.data_ptr() for buf in v_buffers],
+        dtype=torch.int64,
+        device=device,
+    )
+    # Use integer dtype matching element size for bit-preserving copy
+    int_dtype_map = {1: torch.int8, 2: torch.int16, 4: torch.int32}
+    int_dtype = int_dtype_map.get(dtype_size, torch.int16)
+    staging_typed = staging_buffer.buffer[:total_bytes].view(int_dtype)
+
+    if not hasattr(staging_buffer, "_gather_stream"):
+        staging_buffer._gather_stream = torch.cuda.Stream(device=device)
+
+    staging_buffer._gather_stream.wait_stream(
+        torch.cuda.default_stream(torch.device(device))
+    )
+
+    BLOCK_SIZE = 1024
+    grid = (2 * num_layers, triton.cdiv(per_layer_elems, BLOCK_SIZE))
+
+    with torch.cuda.stream(staging_buffer._gather_stream):
+        _fused_gather_to_staging_kernel[grid](
+            layer_ptrs,
+            page_idx_tensor,
+            staging_typed,
+            num_tokens,
+            total_heads * head_dim,
+            src_head_start * head_dim,
+            per_layer_elems,
+            elems_per_token,
+            page_size,
+            BLOCK_SIZE,
+        )
+
+    staging_buffer._gather_stream.synchronize()
+    return total_bytes
+
+
 def gather_all_layers_to_staging(
     k_buffers: list,
     v_buffers: list,
@@ -249,64 +422,18 @@ def gather_all_layers_to_staging(
     """Gather all layers' K and V head slices into a staging buffer.
 
     Returns total bytes written.
+    Dispatches to Triton fused kernel when available, falls back to torch.gather.
     """
-    import numpy as np
-
-    num_layers = len(k_buffers)
-    head_dim = k_buffers[0].shape[-1]
-    dtype_size = k_buffers[0].element_size()
-    num_tokens = len(page_indices_np) * page_size
-    per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
-
-    torch.cuda.set_device(gpu_id)
-    page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(
-        f"cuda:{gpu_id}"
+    # TODO: re-enable after Triton kernel is validated
+    if _TRITON_AVAILABLE:
+        return _gather_all_layers_triton(
+            k_buffers, v_buffers, page_indices_np, staging_buffer,
+            src_head_start, num_heads, page_size, gpu_id,
+        )
+    return _gather_all_layers_torch(
+        k_buffers, v_buffers, page_indices_np, staging_buffer,
+        src_head_start, num_heads, page_size, gpu_id,
     )
-
-    if not hasattr(staging_buffer, "_gather_stream"):
-        staging_buffer._gather_stream = torch.cuda.Stream(device=f"cuda:{gpu_id}")
-
-    # Ensure gather doesn't read KV data that forward hasn't finished writing
-    staging_buffer._gather_stream.wait_stream(
-        torch.cuda.default_stream(torch.device(f"cuda:{gpu_id}"))
-    )
-
-    staging_view = staging_buffer.buffer
-    offset = 0
-    with torch.cuda.stream(staging_buffer._gather_stream):
-        for layer_id in range(num_layers):
-            lv = (
-                staging_view[offset : offset + per_layer_bytes]
-                .view(k_buffers[layer_id].dtype)
-                .reshape(num_tokens, num_heads, head_dim)
-            )
-            gather_kv_head_slices(
-                k_buffers[layer_id],
-                page_idx_tensor,
-                src_head_start,
-                num_heads,
-                lv,
-                page_size,
-            )
-            offset += per_layer_bytes
-        for layer_id in range(num_layers):
-            lv = (
-                staging_view[offset : offset + per_layer_bytes]
-                .view(v_buffers[layer_id].dtype)
-                .reshape(num_tokens, num_heads, head_dim)
-            )
-            gather_kv_head_slices(
-                v_buffers[layer_id],
-                page_idx_tensor,
-                src_head_start,
-                num_heads,
-                lv,
-                page_size,
-            )
-            offset += per_layer_bytes
-
-    staging_buffer._gather_stream.synchronize()
-    return offset
 
 
 def scatter_staging_to_kv(
