@@ -242,6 +242,8 @@ class MooncakeKVManager(CommonKVManager):
             self._staging = DecodeStagingState() if self.enable_staging else None
             if self._staging is not None:
                 self._init_staging_allocator()
+            self._staging_handler = None
+            self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
             self.start_decode_thread()
 
     def init_engine(self):
@@ -1014,7 +1016,9 @@ class MooncakeKVManager(CommonKVManager):
                 # Each prefill sends all its dims to the appropriate offset in decode
                 src_dim_start = 0
                 num_dims_to_send = src_dim
-                dst_dim_start = local_tp_rank_in_group * src_dim
+                writers_per_decode = self.attn_tp_size // dst_attn_tp_size
+                local_writer_idx = local_tp_rank_in_group % writers_per_decode
+                dst_dim_start = local_writer_idx * src_dim
             else:
                 # 1 prefill rank sends to multiple decode ranks
                 # Prefill sends a slice of its dims to each decode rank
@@ -1311,11 +1315,17 @@ class MooncakeKVManager(CommonKVManager):
                     page_start = int(msg[3].decode("ascii"))
                     num_pages = int(msg[4].decode("ascii"))
                     session_id = msg[5].decode("ascii")
-                    if room not in self._staging.pending_chunk_scatters:
-                        self._staging.pending_chunk_scatters[room] = []
-                    self._staging.pending_chunk_scatters[room].append(
-                        (chunk_idx, page_start, num_pages, session_id)
+                    self._chunk_writer_counts[room][chunk_idx].append(
+                        (page_start, num_pages, session_id)
                     )
+                    handler = self._staging_handler
+                    writers_arrived = len(self._chunk_writer_counts[room][chunk_idx])
+                    if handler is not None:
+                        if writers_arrived >= handler.num_writers:
+                            handler.submit_chunk_scatter(
+                                room, chunk_idx, page_start, num_pages
+                            )
+                            del self._chunk_writer_counts[room][chunk_idx]
                     continue
 
                 if msg[0] == b"STAGING_REQ":
@@ -1337,6 +1347,10 @@ class MooncakeKVManager(CommonKVManager):
                             self.prefill_response_tracker[bootstrap_room]
                         )
                         if arrived_response_num == expected_response_num:
+                            handler = self._staging_handler
+                            if handler is not None:
+                                handler.submit_last_scatter_async(bootstrap_room)
+                            self._chunk_writer_counts.pop(bootstrap_room, None)
                             self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:
                     self.record_failure(

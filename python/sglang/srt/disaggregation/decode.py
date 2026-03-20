@@ -707,6 +707,10 @@ class DecodePreallocQueue:
             decode_req.kv_receiver.init(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
+            if self.transfer_queue.staging_handler is not None:
+                self.transfer_queue.staging_handler.register_decode_req(
+                    decode_req.req.bootstrap_room, decode_req
+                )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
@@ -840,6 +844,11 @@ class DecodeTransferQueue:
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
+        if self.staging_handler is not None:
+            for dr in decode_reqs:
+                self.staging_handler.register_decode_req(
+                    dr.req.bootstrap_room, dr
+                )
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
         """
@@ -923,12 +932,10 @@ class DecodeTransferQueue:
         return True
 
     def _poll_with_staging(self) -> list:
-        """Staging-aware polling: advance scatter, demote incomplete, all_reduce."""
-        self.staging_handler.process_pending_chunks(self.queue)
+        """Staging-aware polling: check scatter events, demote incomplete, all_reduce."""
         for decode_req in self.queue:
             if not self.staging_handler.is_done(decode_req):
-                if decode_req.kv_receiver.poll() == KVPoll.Success:
-                    self.staging_handler.advance_scatter(decode_req, self.queue)
+                self.staging_handler.advance_scatter(decode_req)
 
         raw_polls = [int(dr.kv_receiver.poll()) for dr in self.queue]
         for i, decode_req in enumerate(self.queue):
@@ -948,6 +955,9 @@ class DecodeTransferQueue:
         self.staging_handler = DecodeStagingHandler.try_create(
             self.scheduler, self.tp_rank
         )
+        kv_mgr = getattr(self.scheduler, "_decode_kv_manager", None)
+        if kv_mgr is not None:
+            kv_mgr._staging_handler = self.staging_handler
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
@@ -1013,6 +1023,10 @@ class DecodeTransferQueue:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
         for i in indices_to_remove:
+            if self.staging_handler is not None:
+                self.staging_handler.unregister_decode_req(
+                    self.queue[i].req.bootstrap_room
+                )
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
             self.req_to_metadata_buffer_idx_allocator.free(idx)
