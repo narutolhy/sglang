@@ -846,9 +846,7 @@ class DecodeTransferQueue:
         self.queue.extend(decode_reqs)
         if self.staging_handler is not None:
             for dr in decode_reqs:
-                self.staging_handler.register_decode_req(
-                    dr.req.bootstrap_room, dr
-                )
+                self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
         """

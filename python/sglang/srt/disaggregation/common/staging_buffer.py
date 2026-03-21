@@ -13,100 +13,105 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import List, Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 logger = logging.getLogger(__name__)
 
-try:
-    import triton
-    import triton.language as tl
+# TODO(yangminl): remove torch fallback implementations once the Triton kernels
+# have been validated in production across all configurations.
+_USE_TRITON_STAGING = not bool(os.environ.get("SGLANG_STAGING_USE_TORCH", ""))
 
-    @triton.jit
-    def _fused_gather_to_staging_kernel(
-        layer_ptrs,
-        page_indices,
-        staging,
-        num_tokens,
-        stride_pool_token,
-        head_offset,
-        per_layer_elems,
-        ELEMS_PER_TOKEN: tl.constexpr,
-        PAGE_SIZE: tl.constexpr,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        layer_id = tl.program_id(0)
-        block_id = tl.program_id(1)
 
-        layer_ptr = tl.load(layer_ptrs + layer_id).to(staging.dtype)
+@triton.jit
+def _fused_gather_to_staging_kernel(
+    layer_ptrs,
+    page_indices,
+    staging,
+    num_tokens,
+    stride_pool_token,
+    head_offset,
+    per_layer_elems,
+    ELEMS_PER_TOKEN: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    layer_id = tl.program_id(0)
+    block_id = tl.program_id(1)
 
-        offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < per_layer_elems
+    layer_ptr = tl.load(layer_ptrs + layer_id).to(staging.dtype)
 
-        t_idx = offsets // ELEMS_PER_TOKEN
-        e_idx = offsets % ELEMS_PER_TOKEN
+    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < per_layer_elems
 
-        page_id = t_idx // PAGE_SIZE
-        intra_page = t_idx % PAGE_SIZE
-        page_val = tl.load(page_indices + page_id, mask=mask, other=0)
-        pool_token = page_val * PAGE_SIZE + intra_page
+    t_idx = offsets // ELEMS_PER_TOKEN
+    e_idx = offsets % ELEMS_PER_TOKEN
 
-        src_offsets = pool_token * stride_pool_token.to(tl.int64) + head_offset.to(tl.int64) + e_idx
-        vals = tl.load(layer_ptr + src_offsets, mask=mask)
+    page_id = t_idx // PAGE_SIZE
+    intra_page = t_idx % PAGE_SIZE
+    page_val = tl.load(page_indices + page_id, mask=mask, other=0)
+    pool_token = page_val * PAGE_SIZE + intra_page
 
-        dst_offsets = tl.program_id(0).to(tl.int64) * per_layer_elems.to(tl.int64) + offsets
-        tl.store(staging + dst_offsets, vals, mask=mask)
+    src_offsets = (
+        pool_token * stride_pool_token.to(tl.int64) + head_offset.to(tl.int64) + e_idx
+    )
+    vals = tl.load(layer_ptr + src_offsets, mask=mask)
 
-    @triton.jit
-    def _fused_scatter_from_staging_kernel(
-        layer_ptrs,
-        page_indices,
-        staging,
-        writer_head_offsets,
-        num_tokens,
-        stride_pool_token,
-        per_layer_elems,
-        ELEMS_PER_TOKEN: tl.constexpr,
-        PAGE_SIZE: tl.constexpr,
-        NUM_LAYERS_X2: tl.constexpr,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        prog_id = tl.program_id(0)
-        block_id = tl.program_id(1)
+    dst_offsets = tl.program_id(0).to(tl.int64) * per_layer_elems.to(tl.int64) + offsets
+    tl.store(staging + dst_offsets, vals, mask=mask)
 
-        writer_id = prog_id // NUM_LAYERS_X2
-        layer_kv_id = prog_id % NUM_LAYERS_X2
 
-        layer_ptr = tl.load(layer_ptrs + layer_kv_id).to(staging.dtype)
-        head_offset = tl.load(writer_head_offsets + writer_id)
+@triton.jit
+def _fused_scatter_from_staging_kernel(
+    layer_ptrs,
+    page_indices,
+    staging,
+    writer_head_offsets,
+    num_tokens,
+    stride_pool_token,
+    per_layer_elems,
+    ELEMS_PER_TOKEN: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    NUM_LAYERS_X2: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    prog_id = tl.program_id(0)
+    block_id = tl.program_id(1)
 
-        offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < per_layer_elems
+    writer_id = prog_id // NUM_LAYERS_X2
+    layer_kv_id = prog_id % NUM_LAYERS_X2
 
-        t_idx = offsets // ELEMS_PER_TOKEN
-        e_idx = offsets % ELEMS_PER_TOKEN
+    layer_ptr = tl.load(layer_ptrs + layer_kv_id).to(staging.dtype)
+    head_offset = tl.load(writer_head_offsets + writer_id)
 
-        page_id = t_idx // PAGE_SIZE
-        intra_page = t_idx % PAGE_SIZE
-        page_val = tl.load(page_indices + page_id, mask=mask, other=0)
-        pool_token = page_val * PAGE_SIZE + intra_page
+    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < per_layer_elems
 
-        per_rank_elems = per_layer_elems.to(tl.int64) * NUM_LAYERS_X2
-        src_offsets = (
-            writer_id.to(tl.int64) * per_rank_elems
-            + layer_kv_id.to(tl.int64) * per_layer_elems.to(tl.int64)
-            + offsets
-        )
-        vals = tl.load(staging + src_offsets, mask=mask)
+    t_idx = offsets // ELEMS_PER_TOKEN
+    e_idx = offsets % ELEMS_PER_TOKEN
 
-        dst_offsets = pool_token * stride_pool_token.to(tl.int64) + head_offset.to(tl.int64) + e_idx
-        tl.store(layer_ptr + dst_offsets, vals, mask=mask)
+    page_id = t_idx // PAGE_SIZE
+    intra_page = t_idx % PAGE_SIZE
+    page_val = tl.load(page_indices + page_id, mask=mask, other=0)
+    pool_token = page_val * PAGE_SIZE + intra_page
 
-    _TRITON_AVAILABLE = True
-except ImportError:
-    _TRITON_AVAILABLE = False
+    per_rank_elems = per_layer_elems.to(tl.int64) * NUM_LAYERS_X2
+    src_offsets = (
+        writer_id.to(tl.int64) * per_rank_elems
+        + layer_kv_id.to(tl.int64) * per_layer_elems.to(tl.int64)
+        + offsets
+    )
+    vals = tl.load(staging + src_offsets, mask=mask)
+
+    dst_offsets = (
+        pool_token * stride_pool_token.to(tl.int64) + head_offset.to(tl.int64) + e_idx
+    )
+    tl.store(layer_ptr + dst_offsets, vals, mask=mask)
 
 
 class StagingBuffer:
@@ -468,15 +473,26 @@ def gather_all_layers_to_staging(
     Returns total bytes written.
     Dispatches to Triton fused kernel when available, falls back to torch.gather.
     """
-    # TODO: re-enable after Triton kernel is validated
-    if _TRITON_AVAILABLE:
+    if _USE_TRITON_STAGING:
         return _gather_all_layers_triton(
-            k_buffers, v_buffers, page_indices_np, staging_buffer,
-            src_head_start, num_heads, page_size, gpu_id,
+            k_buffers,
+            v_buffers,
+            page_indices_np,
+            staging_buffer,
+            src_head_start,
+            num_heads,
+            page_size,
+            gpu_id,
         )
     return _gather_all_layers_torch(
-        k_buffers, v_buffers, page_indices_np, staging_buffer,
-        src_head_start, num_heads, page_size, gpu_id,
+        k_buffers,
+        v_buffers,
+        page_indices_np,
+        staging_buffer,
+        src_head_start,
+        num_heads,
+        page_size,
+        gpu_id,
     )
 
 
@@ -573,30 +589,42 @@ def _scatter_staging_to_kv_triton(
 
     # All writers share the same num_heads; only dst_head_start differs
     _, num_heads, _, _ = compute_head_slice_params(
-        prefill_attn_tp_size, decode_attn_tp_size, 0, dst_tp_rank, total_kv_heads,
+        prefill_attn_tp_size,
+        decode_attn_tp_size,
+        0,
+        dst_tp_rank,
+        total_kv_heads,
     )
     elems_per_token = num_heads * head_dim
     per_layer_elems = num_tokens * elems_per_token
 
     layer_ptrs = torch.tensor(
         [buf.data_ptr() for buf in k_buffers] + [buf.data_ptr() for buf in v_buffers],
-        dtype=torch.int64, device=device,
+        dtype=torch.int64,
+        device=device,
     )
 
     writer_head_offsets = torch.tensor(
         [
             compute_head_slice_params(
-                prefill_attn_tp_size, decode_attn_tp_size,
-                wr, dst_tp_rank, total_kv_heads,
-            )[2] * head_dim
+                prefill_attn_tp_size,
+                decode_attn_tp_size,
+                wr,
+                dst_tp_rank,
+                total_kv_heads,
+            )[2]
+            * head_dim
             for wr in range(num_writers)
         ],
-        dtype=torch.int64, device=device,
+        dtype=torch.int64,
+        device=device,
     )
 
     int_dtype_map = {1: torch.int8, 2: torch.int16, 4: torch.int32}
     int_dtype = int_dtype_map.get(dtype_size, torch.int16)
-    total_staging_bytes = num_tokens * elems_per_token * dtype_size * num_layers * 2 * num_writers
+    total_staging_bytes = (
+        num_tokens * elems_per_token * dtype_size * num_layers * 2 * num_writers
+    )
     staging_typed = staging_buffer_view[:total_staging_bytes].view(int_dtype)
 
     BLOCK_SIZE = 1024
@@ -630,16 +658,28 @@ def scatter_staging_to_kv(
     total_kv_heads: int,
 ) -> None:
     """Scatter data from a contiguous staging region into KV cache buffers."""
-    if _TRITON_AVAILABLE:
+    if _USE_TRITON_STAGING:
         return _scatter_staging_to_kv_triton(
-            staging_buffer_view, k_buffers, v_buffers, page_idx_tensor,
-            page_size, prefill_attn_tp_size, decode_attn_tp_size,
-            dst_tp_rank, total_kv_heads,
+            staging_buffer_view,
+            k_buffers,
+            v_buffers,
+            page_idx_tensor,
+            page_size,
+            prefill_attn_tp_size,
+            decode_attn_tp_size,
+            dst_tp_rank,
+            total_kv_heads,
         )
     return _scatter_staging_to_kv_torch(
-        staging_buffer_view, k_buffers, v_buffers, page_idx_tensor,
-        page_size, prefill_attn_tp_size, decode_attn_tp_size,
-        dst_tp_rank, total_kv_heads,
+        staging_buffer_view,
+        k_buffers,
+        v_buffers,
+        page_idx_tensor,
+        page_size,
+        prefill_attn_tp_size,
+        decode_attn_tp_size,
+        dst_tp_rank,
+        total_kv_heads,
     )
 
 

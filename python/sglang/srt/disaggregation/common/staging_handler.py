@@ -12,7 +12,6 @@ import dataclasses
 import logging
 import struct
 import threading
-from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -102,7 +101,9 @@ class DecodeStagingHandler:
         if prefill_tp == 0 or prefill_tp == decode_tp:
             return None
 
-        from sglang.srt.disaggregation.common.staging_buffer import resolve_total_kv_heads
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            resolve_total_kv_heads,
+        )
 
         total_kv_heads = resolve_total_kv_heads(kv_manager.kv_args, decode_tp)
         return cls(
@@ -144,7 +145,8 @@ class DecodeStagingHandler:
                 "[STAGING] submit_chunk_scatter: room=%s not registered, "
                 "chunk_idx=%s. This should not happen if register_decode_req "
                 "is called at kv_receiver.init() time.",
-                room, chunk_idx,
+                room,
+                chunk_idx,
             )
             return False
         chunk_infos = getattr(decode_req.kv_receiver, "chunk_staging_infos", [])
@@ -165,7 +167,9 @@ class DecodeStagingHandler:
         else:
             logger.warning(
                 "submit_chunk_scatter failed room=%s chunk_idx=%s tp_rank=%s",
-                room, chunk_idx, self.tp_rank,
+                room,
+                chunk_idx,
+                self.tp_rank,
             )
         return ok
 
@@ -249,7 +253,9 @@ class DecodeStagingHandler:
         runs on scatter_stream so that the decode_thread never blocks on
         the default stream (which carries the main-thread forward pass).
         """
-        from sglang.srt.disaggregation.common.staging_buffer import scatter_staging_to_kv
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            scatter_staging_to_kv,
+        )
 
         k_buffers = self.kv_buffer_info["k_buffers"]
         v_buffers = self.kv_buffer_info["v_buffers"]
@@ -348,7 +354,6 @@ class DecodeStagingHandler:
                         )
                 except Exception:
                     pass
-
 
 
 def is_watermark_ready(
@@ -637,7 +642,8 @@ def handle_staging_req(
     if staging_allocator is None:
         logger.warning(
             "STAGING_REQ ignored: allocator is None room=%s chunk=%s",
-            room, chunk_idx,
+            room,
+            chunk_idx,
         )
         return
 
@@ -645,7 +651,9 @@ def handle_staging_req(
     if receiver is None:
         logger.warning(
             "STAGING_REQ dropped: no receiver for room=%s chunk=%s session=%s",
-            room, chunk_idx, session_id,
+            room,
+            chunk_idx,
+            session_id,
         )
         return
     infos = getattr(receiver, "chunk_staging_infos", [])
