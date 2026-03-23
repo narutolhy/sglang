@@ -18,6 +18,7 @@ from __future__ import annotations
 import bisect
 import gc
 import logging
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
@@ -27,7 +28,7 @@ import tqdm
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.compilation.compilation_config import CompilationConfig
-from sglang.srt.compilation.compile import install_torch_compiled, set_compiled
+from sglang.srt.compilation.compile import install_torch_compiled
 from sglang.srt.compilation.piecewise_context_manager import (
     enable_piecewise_cuda_graph,
     enable_piecewise_cuda_graph_compile,
@@ -59,6 +60,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
 
+# Suppress Dynamo warning about tracing through lru_cache-wrapped functions (e.g., is_arch_support_pdl).
+warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -196,7 +199,9 @@ class PiecewiseCudaGraphRunner:
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
-        self.max_num_tokens = max(self.capture_num_tokens)
+        self.max_num_tokens = (
+            max(self.capture_num_tokens) if self.capture_num_tokens else 8192
+        )
         self.max_bs = model_runner.req_to_token_pool.size
 
         self.is_multimodal = model_runner.is_multimodal
@@ -278,6 +283,10 @@ class PiecewiseCudaGraphRunner:
             with patch_model(
                 language_model.model, self.compile_config.compiler
             ) as patched_model:
+
+                # Dummy warmup for jit kernel
+                self.warmup_compile(num_tokens=self.capture_num_tokens[0])
+
                 install_torch_compiled(
                     patched_model,
                     fullgraph=True,
@@ -286,7 +295,7 @@ class PiecewiseCudaGraphRunner:
                     graph_pool=get_global_graph_memory_pool(),
                 )
 
-                with set_compiled(True), enable_piecewise_cuda_graph_compile():
+                with enable_piecewise_cuda_graph_compile():
                     compile_range = (
                         tqdm.tqdm(list(reversed(self.capture_num_tokens)))
                         if get_tensor_model_parallel_rank() == 0
@@ -297,7 +306,7 @@ class PiecewiseCudaGraphRunner:
                             compile_range.set_description(
                                 f"Compiling num tokens ({num_tokens=})"
                             )
-                        self.warmup_torch_compile(num_tokens=num_tokens)
+                        self.warmup_compile(num_tokens=num_tokens)
 
                 set_global_graph_memory_pool(self.device_module.graph_pool_handle())
                 set_graph_pool_id(get_global_graph_memory_pool())
@@ -305,16 +314,11 @@ class PiecewiseCudaGraphRunner:
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
                 # Capture
-                try:
-                    self.capture()
-                except RuntimeError as e:
-                    raise Exception(
-                        f"Capture cuda graph failed: {e}\n{PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
-                    )
+                self.capture()
 
         self.raw_num_tokens = 0
 
-    def warmup_torch_compile(self, num_tokens: int):
+    def warmup_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
         buffers = self.buffers
         input_ids = buffers.input_ids[:num_tokens]
@@ -409,6 +413,10 @@ class PiecewiseCudaGraphRunner:
         return torch.int64 if not is_npu() else torch.int32
 
     def can_run(self, forward_batch: ForwardBatch):
+        # Disable piecewise cuda graph for input embeddings
+        # TODO(yuwei): fix it
+        if forward_batch.input_embeds is not None:
+            return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
@@ -452,8 +460,7 @@ class PiecewiseCudaGraphRunner:
                             f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                         )
 
-                    with set_compiled(True):
-                        self.capture_one_batch_size(num_tokens)
+                    self.capture_one_batch_size(num_tokens)
 
     def capture_one_batch_size(self, num_tokens: int):
         buffers = self.buffers
@@ -640,7 +647,7 @@ class PiecewiseCudaGraphRunner:
 
         out_cache_loc_swa = (
             buffers.out_cache_loc_swa[:static_num_tokens]
-            if forward_batch.out_cache_loc_swa is not None
+            if buffers.out_cache_loc_swa is not None
             else None
         )
 
@@ -722,7 +729,11 @@ class PiecewiseCudaGraphRunner:
             temperature=forward_batch.temperature,
             top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
             top_p=forward_batch.top_p,
+            dimensions=forward_batch.dimensions,
         )
+
+        if out_cache_loc_swa is not None:
+            self.model_runner.token_to_kv_pool.set_swa_loc(out_cache_loc_swa)
 
         return static_forward_batch
 
@@ -743,13 +754,12 @@ class PiecewiseCudaGraphRunner:
                 self.moe_layers,
                 self.moe_fusions,
             ):
-                with set_compiled(True):
-                    output = self.model_runner.model.forward(
-                        static_forward_batch.input_ids,
-                        static_forward_batch.positions,
-                        static_forward_batch,
-                        **kwargs,
-                    )
+                output = self.model_runner.model.forward(
+                    static_forward_batch.input_ids,
+                    static_forward_batch.positions,
+                    static_forward_batch,
+                    **kwargs,
+                )
                 if isinstance(output, LogitsProcessorOutput):
                     return LogitsProcessorOutput(
                         next_token_logits=output.next_token_logits[
@@ -798,12 +808,3 @@ class PiecewiseCudaGraphRunner:
                 )
 
         return spec_info
-
-
-PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG = (
-    "Possible solutions:\n"
-    "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
-    "2. set --piecewise-cuda-graph-max-tokens to a smaller value (e.g., 512)\n"
-    "3. disable Piecewise CUDA graph by unset --enable-piecewise-cuda-graph\n"
-    "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
-)

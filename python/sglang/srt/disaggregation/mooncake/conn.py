@@ -28,11 +28,14 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    filter_kv_indices_for_cp_rank,
+)
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import format_tcp_address, is_valid_ipv6_address
+from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +56,7 @@ class TransferKVChunk:
     room: int
     prefill_kv_indices: npt.NDArray[np.int32]
     index_slice: slice
-    is_last: bool
+    is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List[int]]
 
@@ -336,9 +339,10 @@ class MooncakeKVManager(CommonKVManager):
     def _send_chunk_ready(self, req, chunk_idx, kv_chunk, local_rank):
         """Notify decode that a non-last staging chunk RDMA is complete."""
         try:
+            na = NetworkAddress(req.endpoint, req.dst_port)
             self._connect(
-                format_tcp_address(req.endpoint, req.dst_port),
-                is_ipv6=is_valid_ipv6_address(req.endpoint),
+                na.to_tcp(),
+                is_ipv6=na.is_ipv6,
             ).send_multipart(
                 [
                     b"CHUNK_READY",
@@ -407,7 +411,7 @@ class MooncakeKVManager(CommonKVManager):
                 target_info.dst_kv_item_len,
                 executor,
             )
-        elif ret == 0 and not kv_chunk.is_last:
+        elif ret == 0 and not kv_chunk.is_last_chunk:
             self._send_chunk_ready(req, chunk_idx, kv_chunk, local_rank)
         return (ret, False)
 
@@ -841,9 +845,8 @@ class MooncakeKVManager(CommonKVManager):
         aux_index: int,
         data: bytes,
     ):
-        socket = self._connect(
-            format_tcp_address(remote, dst_port), is_ipv6=is_valid_ipv6_address(remote)
-        )
+        na = NetworkAddress(remote, dst_port)
+        socket = self._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
 
         socket.send_multipart(
             [
@@ -1050,9 +1053,8 @@ class MooncakeKVManager(CommonKVManager):
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
-        self._connect(
-            format_tcp_address(remote, dst_port), is_ipv6=is_valid_ipv6_address(remote)
-        ).send_multipart(
+        na = NetworkAddress(remote, dst_port)
+        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
             [
                 str(room).encode("ascii"),
                 str(status).encode("ascii"),
@@ -1081,6 +1083,12 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 polls = []
                 dst_ranks_infos = []
+                # Unique id per prefill sender so decode's response set size matches expected_response_num.
+                prefill_unique_rank = (
+                    self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+                    + self.pp_rank * self.attn_cp_size
+                    + self.attn_cp_rank
+                )
                 local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
                 staging_deferred = False
                 for req in reqs_to_be_processed:
@@ -1098,7 +1106,7 @@ class MooncakeKVManager(CommonKVManager):
                                     req.dst_port,
                                     req.room,
                                     KVPoll.Failed,
-                                    local_rank,
+                                    prefill_unique_rank,
                                 )
                                 break
 
@@ -1177,11 +1185,11 @@ class MooncakeKVManager(CommonKVManager):
                                 req.dst_port,
                                 req.room,
                                 KVPoll.Failed,
-                                local_rank,
+                                prefill_unique_rank,
                             )
                             break
 
-                        if kv_chunk.is_last:
+                        if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices is not None:
                                 self.maybe_send_extra(
                                     req,
@@ -1208,12 +1216,16 @@ class MooncakeKVManager(CommonKVManager):
                                 self.update_status(req.room, status)
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
-                                        endpoint, dst_port, room, status, local_rank
+                                        endpoint,
+                                        dst_port,
+                                        room,
+                                        status,
+                                        prefill_unique_rank,
                                     )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
-                        if kv_chunk.is_last and req.room in self.request_status:
+                        if kv_chunk.is_last_chunk and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
 
                 if staging_deferred:
@@ -1421,12 +1433,12 @@ class MooncakeKVManager(CommonKVManager):
         bootstrap_room: int,
         kv_indices: npt.NDArray[np.int32],
         index_slice: slice,
-        is_last: bool,
+        is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        assert not is_last or (is_last and aux_index is not None)
+        assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
         if (
             bootstrap_room not in self.request_status
@@ -1450,15 +1462,16 @@ class MooncakeKVManager(CommonKVManager):
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
 
-        chunk = TransferKVChunk(
-            room=bootstrap_room,
-            prefill_kv_indices=kv_indices,
-            index_slice=index_slice,
-            is_last=is_last,
-            prefill_aux_index=aux_index,
-            state_indices=state_indices,
+        self.transfer_queues[shard_idx].put(
+            TransferKVChunk(
+                room=bootstrap_room,
+                prefill_kv_indices=kv_indices,
+                index_slice=index_slice,
+                is_last_chunk=is_last_chunk,
+                prefill_aux_index=aux_index,
+                state_indices=state_indices,
+            )
         )
-        self.transfer_queues[shard_idx].put(chunk)
 
     def get_session_id(self):
         return self.engine.get_session_id()
@@ -1516,9 +1529,23 @@ class MooncakeKVSender(CommonKVSender):
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
-        is_last = self.curr_idx == self.num_kv_indices
+        is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        if not is_last:
+        # Special handling for cp
+        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+            kv_indices, index_slice = filter_kv_indices_for_cp_rank(
+                self.kv_mgr,
+                kv_indices,
+                index_slice,
+            )
+        elif self.kv_mgr.is_dummy_cp_rank:
+            if not is_last_chunk:
+                return
+            else:
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+                return
+
+        if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
                 kv_indices,

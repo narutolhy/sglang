@@ -53,6 +53,7 @@ class ModelTaskType(Enum):
     T2I = auto()  # Text to Image
     I2I = auto()  # Image to Image
     TI2I = auto()  # Image to Image or Text-Image to Image
+    I2M = auto()  # Image to Mesh
 
     def is_image_gen(self) -> bool:
         return (
@@ -62,7 +63,11 @@ class ModelTaskType(Enum):
         )
 
     def requires_image_input(self) -> bool:
-        return self == ModelTaskType.I2V or self == ModelTaskType.I2I
+        return (
+            self == ModelTaskType.I2V
+            or self == ModelTaskType.I2I
+            or self == ModelTaskType.I2M
+        )
 
     def accepts_image_input(self) -> bool:
         return (
@@ -70,9 +75,12 @@ class ModelTaskType(Enum):
             or self == ModelTaskType.I2I
             or self == ModelTaskType.TI2I
             or self == ModelTaskType.TI2V
+            or self == ModelTaskType.I2M
         )
 
     def data_type(self) -> DataType:
+        if self == ModelTaskType.I2M:
+            return DataType.MESH
         if self.is_image_gen():
             return DataType.IMAGE
         else:
@@ -176,6 +184,7 @@ class PipelineConfig:
     vae_config: VAEConfig = field(default_factory=VAEConfig)
     vae_precision: str = "fp32"
     vae_tiling: bool = True
+    vae_slicing: bool = False
     vae_sp: bool = True
 
     # Image encoder configuration
@@ -232,6 +241,19 @@ class PipelineConfig:
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return sigmas
+
+    def get_classifier_free_guidance_scale(self, batch, guidance_scale: float) -> float:
+        return guidance_scale
+
+    def postprocess_cfg_noise(
+        self,
+        batch,
+        noise_pred: torch.Tensor,
+        noise_pred_cond: torch.Tensor,
+    ) -> torch.Tensor:
+        # Model-specific CFG variants can override this hook
+        # e.g. Qwen-Image's true-CFG norm matching.
+        return noise_pred
 
     ## For ImageVAEEncodingStage
     def preprocess_condition_image(
@@ -305,6 +327,9 @@ class PipelineConfig:
 
         return shape
 
+    def get_latent_dtype(self, prompt_dtype: torch.dtype) -> torch.dtype:
+        return prompt_dtype
+
     def allow_set_num_frames(self):
         return False
 
@@ -338,6 +363,15 @@ class PipelineConfig:
         # For video latents [B, C, T_local, H, W], gather along time dim=2
         latents = sequence_model_parallel_all_gather(latents, dim=2)
         return latents
+
+    def gather_noise_pred_for_sp(self, batch, noise_pred):
+        noise_pred = self.gather_latents_for_sp(noise_pred)
+        raw_latent_shape = getattr(batch, "raw_latent_shape", None)
+        if raw_latent_shape is not None and noise_pred.dim() == 3:
+            orig_s = raw_latent_shape[1]
+            if noise_pred.shape[1] > orig_s:
+                noise_pred = noise_pred[:, :orig_s, :]
+        return noise_pred
 
     def preprocess_vae_image(self, batch, vae_image_processor):
         pass
@@ -428,6 +462,13 @@ class PipelineConfig:
             default=PipelineConfig.flow_shift,
             help="Flow shift parameter",
         )
+        parser.add_argument(
+            f"--{prefix_with_dot}resolution",
+            type=int,
+            dest=f"{prefix_with_dot.replace('-', '_')}resolution",
+            default=None,
+            help="Override the selected pipeline config's resolution setting. Only applies to pipelines that define a resolution field.",
+        )
 
         # DiT configuration
         parser.add_argument(
@@ -454,6 +495,13 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}vae_tiling",
             default=PipelineConfig.vae_tiling,
             help="Enable VAE tiling",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}vae-slicing",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}vae_slicing",
+            default=PipelineConfig.vae_slicing,
+            help="Enable VAE slicing",
         )
         parser.add_argument(
             f"--{prefix_with_dot}vae-sp",
@@ -531,7 +579,7 @@ class PipelineConfig:
         cls, kwargs: dict[str, Any], config_cli_prefix: str = ""
     ) -> "PipelineConfig":
         """
-        Load PipelineConfig from kwargs Dictionary.
+        Load PipelineConfig from kwargs Dictionary, as part of the ServerArg initialization process
         kwargs: dictionary of kwargs
         config_cli_prefix: prefix of CLI arguments for this PipelineConfig instance
         """
@@ -575,7 +623,11 @@ class PipelineConfig:
                     f"using {pipeline_config_cls.__name__} directly without model_index.json"
                 )
             else:
-                model_info = get_model_info(model_path, backend=kwargs.get("backend"))
+                model_info = get_model_info(
+                    model_path,
+                    backend=kwargs.get("backend"),
+                    model_id=kwargs.get("model_id"),
+                )
                 if model_info is None:
                     from sglang.multimodal_gen.registry import (
                         _PIPELINE_CONFIG_REGISTRY,
@@ -591,7 +643,11 @@ class PipelineConfig:
                     )
                 pipeline_config_cls = model_info.pipeline_config_cls
         else:
-            model_info = get_model_info(model_path, backend=kwargs.get("backend"))
+            model_info = get_model_info(
+                model_path,
+                backend=kwargs.get("backend"),
+                model_id=kwargs.get("model_id"),
+            )
             if model_info is None:
                 raise ValueError(
                     f"Could not get model info for '{model_path}'. "

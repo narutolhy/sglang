@@ -747,7 +747,7 @@ def prefetch_staging_reqs(
     """
     import zmq
 
-    from sglang.srt.utils import format_tcp_address, is_valid_ipv6_address
+    from sglang.srt.utils.network import NetworkAddress
 
     page_size = kv_buffer_tensors["page_size"]
     cps = chunked_prefill_size or 8192
@@ -770,10 +770,11 @@ def prefetch_staging_reqs(
             remaining = total_pages - chunk_idx * full_chunk_pages
             chunk_pages = min(full_chunk_pages, remaining)
             try:
-                ep = format_tcp_address(tinfo.endpoint, tinfo.dst_port)
+                na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
+                ep = na.to_tcp()
                 if ep not in prefetch_sockets:
                     sock = zmq.Context().socket(zmq.PUSH)
-                    if is_valid_ipv6_address(tinfo.endpoint):
+                    if na.is_ipv6:
                         sock.setsockopt(zmq.IPV6, 1)
                     sock.connect(ep)
                     prefetch_sockets[ep] = sock
