@@ -39,6 +39,39 @@ from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+
+    @triton.jit
+    def _pack_strided_heads_kernel(
+        src_base_ptr,  # int64 tensor [1]: layer base GPU pointer
+        page_indices_ptr,  # int64 tensor [num_pages]: page indices
+        dst_ptr,  # int64: staging buffer data_ptr
+        src_item_len,  # bytes per page in source KV buffer
+        src_head_offset,  # byte offset to head slice within each token
+        src_stride,  # bytes between consecutive tokens in source
+        dst_stride,  # bytes between consecutive tokens in dst (contiguous)
+        page_size,  # tokens per page
+        BLOCK_SIZE: tl.constexpr,  # >= dst_stride, power of 2
+    ):
+        """Pack strided head slices from KV cache pages into contiguous staging buffer."""
+        pid = tl.program_id(0)  # page index
+        page_id = tl.load(page_indices_ptr + pid)
+        offsets = tl.arange(0, BLOCK_SIZE)
+        mask = offsets < dst_stride
+        src_page = tl.load(src_base_ptr) + page_id * src_item_len + src_head_offset
+        dst_page = dst_ptr + pid * page_size * dst_stride
+        for t in range(page_size):
+            src = (src_page + t * src_stride + offsets).to(tl.pointer_type(tl.uint8))
+            dst = (dst_page + t * dst_stride + offsets).to(tl.pointer_type(tl.uint8))
+            tl.store(dst, tl.load(src, mask=mask), mask=mask)
+
+except ImportError:
+    _HAS_TRITON = False
+
 
 class KVTransferError(Exception):
     def __init__(self, bootstrap_room: int, failure_reason: str):
@@ -437,20 +470,71 @@ class MooncakeKVManager(CommonKVManager):
         dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice_to_send
         heads_bytes_per_token_to_send = num_heads_to_send * bytes_per_head_slice_to_send
 
-        # Sanity check: The data sub-slice to be sent should fit into the dst buffer.
-        # This means heads_bytes_per_token_to_send <= (dst_kv_item_len // page_size)
-        if heads_bytes_per_token_to_send > (dst_kv_item_len // page_size):
+        bytes_per_token_on_prefill = src_kv_item_len // page_size
+        bytes_per_token_on_decode = dst_kv_item_len // page_size
+
+        if heads_bytes_per_token_to_send > bytes_per_token_on_decode:
             logger.error(
                 f"[{mooncake_session_id}] slice size ({heads_bytes_per_token_to_send}) exceeds "
-                f"target token slot size ({dst_kv_item_len // page_size})"
+                f"target token slot size ({bytes_per_token_on_decode})"
             )
             return -1
 
+        # Fast path: when sending all heads from src with no offset gap,
+        # tokens within a page are contiguous — use page-level RDMA ops.
+        can_use_page_level = (
+            src_head_slice_offset == 0
+            and heads_bytes_per_token_to_send == bytes_per_token_on_prefill
+            and dst_head_slice_offset == 0
+            and heads_bytes_per_token_to_send == bytes_per_token_on_decode
+        )
+
+        if can_use_page_level:
+            layers_params = [
+                (src_k_ptrs[i], dst_k_ptrs[i], src_kv_item_len)
+                for i in range(layers_current_pp_stage)
+            ] + [
+                (src_v_ptrs[i], dst_v_ptrs[i], src_kv_item_len)
+                for i in range(layers_current_pp_stage)
+            ]
+
+            prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
+                prefill_kv_indices, dst_kv_indices
+            )
+
+            transfer_blocks = []
+            for src_ptr, dst_ptr, item_len in layers_params:
+                for prefill_block, decode_block in zip(
+                    prefill_kv_blocks, dst_kv_blocks
+                ):
+                    src_addr = src_ptr + int(prefill_block[0]) * item_len
+                    dst_addr = dst_ptr + int(decode_block[0]) * item_len
+                    length = item_len * len(prefill_block)
+                    transfer_blocks.append((src_addr, dst_addr, length))
+
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
+
+        # Staged path: use Triton kernel to pack strided head slices into
+        # contiguous staging buffer, then page-level RDMA.
+        dst_is_contiguous = (
+            dst_head_slice_offset == 0
+            and heads_bytes_per_token_to_send == bytes_per_token_on_decode
+        )
+        if dst_is_contiguous and page_size > 1:
+            return self._send_kvcache_slice_staged(
+                mooncake_session_id,
+                prefill_kv_indices, dst_kv_indices,
+                src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs,
+                layers_current_pp_stage,
+                src_kv_item_len, dst_kv_item_len,
+                page_size, bytes_per_token_on_prefill,
+                heads_bytes_per_token_to_send, src_head_slice_offset,
+            )
+
+        # Fallback: per-token slicing with concurrent per-layer transfers
         prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
         decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)
         tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
-        bytes_per_token_on_prefill = src_kv_item_len // page_size
-        bytes_per_token_on_decode = dst_kv_item_len // page_size
         src_token_slot_offsets = (
             tokens_per_page * bytes_per_token_on_prefill + src_head_slice_offset
         )
@@ -466,11 +550,9 @@ class MooncakeKVManager(CommonKVManager):
 
             src_addr_list = src_slice_addrs.reshape(-1).tolist()
             if not src_addr_list:
-                # Nothing to transfer for this layer.
                 return 0
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
-            total_slices = len(src_addr_list)
-            length_list = [heads_bytes_per_token_to_send] * total_slices
+            length_list = [heads_bytes_per_token_to_send] * len(src_addr_list)
             return self.engine.batch_transfer_sync(
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
@@ -491,6 +573,122 @@ class MooncakeKVManager(CommonKVManager):
                 for f in futures:
                     f.cancel()
                 return status
+
+        return 0
+
+    def _send_kvcache_slice_staged(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_indices: npt.NDArray[np.int32],
+        src_k_ptrs: list, src_v_ptrs: list,
+        dst_k_ptrs: list, dst_v_ptrs: list,
+        layers_current_pp_stage: int,
+        src_kv_item_len: int, dst_kv_item_len: int,
+        page_size: int, bytes_per_token_on_prefill: int,
+        heads_bytes_per_token: int, src_head_offset: int,
+    ) -> int:
+        """Pack strided src head slices into contiguous staging buffer using
+        Triton kernel, then do page-level RDMA. Batches kernel launches in
+        chunks to minimize sync overhead while bounding staging buffer size."""
+        import torch
+
+        num_pages = len(prefill_kv_indices)
+        packed_page_size = page_size * heads_bytes_per_token
+        device = f"cuda:{self.kv_args.gpu_id}"
+
+        layer_ptrs = [
+            (src_k_ptrs[i], dst_k_ptrs[i]) for i in range(layers_current_pp_stage)
+        ] + [
+            (src_v_ptrs[i], dst_v_ptrs[i]) for i in range(layers_current_pp_stage)
+        ]
+        num_layers_kv = len(layer_ptrs)
+
+        # Staging buffer sized for CHUNK_LAYERS layers to balance between
+        # minimal syncs and bounded memory usage. Thread-local for concurrency.
+        CHUNK_LAYERS = 16
+        per_layer_staging = num_pages * packed_page_size
+        staging_layers = min(CHUNK_LAYERS, num_layers_kv)
+        staging_size = staging_layers * per_layer_staging
+        tid = threading.get_ident()
+        if not hasattr(self, '_staging_bufs'):
+            self._staging_bufs = {}
+        if tid not in self._staging_bufs or self._staging_bufs[tid].numel() < staging_size:
+            new_size = max(staging_size, 64 * 1024 * 1024)
+            buf = torch.empty(new_size, dtype=torch.uint8, device=device)
+            self.engine.batch_register([buf.data_ptr()], [new_size])
+            self._staging_bufs[tid] = buf
+        staging_ptr = self._staging_bufs[tid].data_ptr()
+
+        if _HAS_TRITON:
+            page_indices_t = torch.tensor(
+                prefill_kv_indices.astype(np.int64), dtype=torch.int64, device=device
+            )
+            BLOCK_SIZE = triton.next_power_of_2(heads_bytes_per_token)
+
+            for chunk_start in range(0, num_layers_kv, CHUNK_LAYERS):
+                chunk_end = min(chunk_start + CHUNK_LAYERS, num_layers_kv)
+
+                for i, layer_idx in enumerate(range(chunk_start, chunk_end)):
+                    src_layer_ptr = layer_ptrs[layer_idx][0]
+                    layer_staging_ptr = staging_ptr + i * per_layer_staging
+                    src_ptr_t = torch.tensor([src_layer_ptr], dtype=torch.int64, device=device)
+                    _pack_strided_heads_kernel[(num_pages,)](
+                        src_ptr_t, page_indices_t, layer_staging_ptr,
+                        src_kv_item_len, src_head_offset,
+                        bytes_per_token_on_prefill, heads_bytes_per_token,
+                        page_size, BLOCK_SIZE=BLOCK_SIZE,
+                    )
+
+                torch.cuda.synchronize(self.kv_args.gpu_id)
+
+                chunk_blocks = []
+                for i, layer_idx in enumerate(range(chunk_start, chunk_end)):
+                    dst_layer_ptr = layer_ptrs[layer_idx][1]
+                    layer_staging_ptr = staging_ptr + i * per_layer_staging
+                    for p, d in enumerate(dst_kv_indices):
+                        chunk_blocks.append((
+                            layer_staging_ptr + p * packed_page_size,
+                            dst_layer_ptr + int(d) * dst_kv_item_len,
+                            packed_page_size,
+                        ))
+                ret = self._transfer_data(mooncake_session_id, chunk_blocks)
+                if ret != 0:
+                    return ret
+        else:
+            # Fallback: cudaMemcpy2D
+            try:
+                cudart = ctypes.CDLL("libcudart.so")
+            except OSError:
+                cudart = ctypes.CDLL("libcudart.so.12")
+            cudaMemcpy2D = cudart.cudaMemcpy2D
+
+            for src_layer_ptr, dst_layer_ptr in layer_ptrs:
+                for p_idx, page_id in enumerate(prefill_kv_indices):
+                    src_page_addr = src_layer_ptr + int(page_id) * src_kv_item_len + src_head_offset
+                    ret = cudaMemcpy2D(
+                        ctypes.c_void_p(staging_ptr + p_idx * packed_page_size),
+                        ctypes.c_size_t(heads_bytes_per_token),
+                        ctypes.c_void_p(src_page_addr),
+                        ctypes.c_size_t(bytes_per_token_on_prefill),
+                        ctypes.c_size_t(heads_bytes_per_token),
+                        ctypes.c_size_t(page_size),
+                        ctypes.c_int(3),
+                    )
+                    if ret != 0:
+                        logger.error(f"cudaMemcpy2D failed with error code {ret}")
+                        return -1
+                torch.cuda.synchronize(self.kv_args.gpu_id)
+
+                layer_blocks = [
+                    (staging_ptr + p * packed_page_size,
+                     dst_layer_ptr + int(d) * dst_kv_item_len,
+                     packed_page_size)
+                    for p, d in enumerate(dst_kv_indices)
+                ]
+                ret = self._transfer_data(mooncake_session_id, layer_blocks)
+                if ret != 0:
+                    return ret
 
         return 0
 
