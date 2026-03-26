@@ -1076,7 +1076,11 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
-                if staging_strategy is None and staging_buffer is not None:
+                if (
+                    self.enable_staging
+                    and staging_strategy is None
+                    and staging_buffer is not None
+                ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
                 reqs_to_be_processed = (
                     self.transfer_infos[kv_chunk.room].values()
@@ -1141,7 +1145,8 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                             )
                         elif (
-                            staging_strategy is not None
+                            self.enable_staging
+                            and staging_strategy is not None
                             and target_rank_registration_info.staging is not None
                         ):
                             ret, deferred = self._do_staging_transfer(
@@ -1253,6 +1258,7 @@ class MooncakeKVManager(CommonKVManager):
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
                 room = waiting_req_bytes[0].decode("ascii")
+                # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
                     wm_round = int(waiting_req_bytes[1].decode("ascii"))
                     wm_tail = int(waiting_req_bytes[2].decode("ascii"))
@@ -1272,6 +1278,7 @@ class MooncakeKVManager(CommonKVManager):
                             )
                             self._staging_ctx.watermark_cv.notify_all()
                     continue
+                # Staging: decode replies with allocated staging offset
                 if room == "STAGING_RSP":
                     stg_room = int(waiting_req_bytes[1].decode("ascii"))
                     stg_chunk_idx = int(waiting_req_bytes[2].decode("ascii"))
@@ -1325,6 +1332,7 @@ class MooncakeKVManager(CommonKVManager):
                     self._handle_aux_data(msg)
                     continue
 
+                # Staging: prefill notifies a chunk written to staging buffer
                 if msg[0] == b"CHUNK_READY":
                     room = int(msg[1].decode("ascii"))
                     chunk_idx = int(msg[2].decode("ascii"))
@@ -1344,6 +1352,7 @@ class MooncakeKVManager(CommonKVManager):
                             del self._chunk_writer_counts[room][chunk_idx]
                     continue
 
+                # Staging: prefill pre-requests staging allocation before forward
                 if msg[0] == b"STAGING_REQ":
                     self._handle_staging_req(msg)
                     continue
@@ -1363,10 +1372,11 @@ class MooncakeKVManager(CommonKVManager):
                             self.prefill_response_tracker[bootstrap_room]
                         )
                         if arrived_response_num == expected_response_num:
-                            handler = self._staging_handler
-                            if handler is not None:
-                                handler.submit_last_scatter_async(bootstrap_room)
-                            self._chunk_writer_counts.pop(bootstrap_room, None)
+                            if self.enable_staging:
+                                handler = self._staging_handler
+                                if handler is not None:
+                                    handler.submit_last_scatter_async(bootstrap_room)
+                                self._chunk_writer_counts.pop(bootstrap_room, None)
                             self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:
                     self.record_failure(
@@ -1663,9 +1673,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
 
-            _stg = getattr(self.kv_mgr, "_staging_ctx", None)
-            _alloc = _stg.allocator if _stg else None
-            if _alloc is not None:
+            if (
+                self.kv_mgr.enable_staging
+                and self.kv_mgr._staging_ctx.allocator is not None
+            ):
+                _alloc = self.kv_mgr._staging_ctx.allocator
                 packed_staging_base_ptr = struct.pack("Q", _alloc.get_base_ptr())
                 staging_total_size_str = str(_alloc.get_total_size()).encode("ascii")
             else:
@@ -1714,8 +1726,10 @@ class MooncakeKVReceiver(CommonKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
 
-        _stg = getattr(self.kv_mgr, "_staging_ctx", None)
-        if _stg is not None and _stg.allocator is not None:
+        if (
+            self.kv_mgr.enable_staging
+            and self.kv_mgr._staging_ctx.allocator is not None
+        ):
             self.chunk_staging_infos = []
             self.kv_mgr.register_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
