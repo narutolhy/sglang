@@ -28,8 +28,8 @@ if TYPE_CHECKING:
 
 
 @dataclasses.dataclass
-class DecodeStagingState:
-    """Staging-specific state for decode mode."""
+class DecodeStagingContext:
+    """Staging-specific context for decode mode."""
 
     allocator: object = None
     room_bootstrap: dict = dataclasses.field(default_factory=dict)
@@ -37,8 +37,8 @@ class DecodeStagingState:
 
 
 @dataclasses.dataclass
-class PrefillStagingState:
-    """Staging-specific state for prefill mode."""
+class PrefillStagingContext:
+    """Staging-specific context for prefill mode."""
 
     buffers: list = dataclasses.field(default_factory=list)
     remote_watermarks: dict = dataclasses.field(default_factory=dict)
@@ -89,7 +89,7 @@ class DecodeStagingHandler:
         kv_manager = getattr(scheduler, "_decode_kv_manager", None)
         if kv_manager is None:
             return None
-        _stg = getattr(kv_manager, "_staging", None)
+        _stg = getattr(kv_manager, "_staging_ctx", None)
         staging_allocator = getattr(_stg, "allocator", None) if _stg else None
         if staging_allocator is None:
             return None
@@ -369,7 +369,7 @@ def is_watermark_ready(
 
 def allocate_chunk_staging_for_receiver(kv_mgr, kv_indices) -> list:
     """Allocate per-chunk staging regions from the ring buffer allocator."""
-    _stg = getattr(kv_mgr, "_staging", None)
+    _stg = getattr(kv_mgr, "_staging_ctx", None)
     staging_allocator = getattr(_stg, "allocator", None) if _stg else None
     if staging_allocator is None:
         return []
@@ -447,10 +447,17 @@ class StagingTransferInfo:
         )
 
     @classmethod
-    def from_zmq_fields(cls, msg: list) -> Optional["StagingTransferInfo"]:
-        offsets_raw = msg[8].decode("ascii") if len(msg) > 8 and msg[8] != b"" else ""
-        rounds_raw = msg[9].decode("ascii") if len(msg) > 9 and msg[9] != b"" else ""
-        ends_raw = msg[10].decode("ascii") if len(msg) > 10 and msg[10] != b"" else ""
+    def from_zmq_fields(
+        cls, msg: list, msg_start_offset: int
+    ) -> Optional["StagingTransferInfo"]:
+        i = msg_start_offset
+        offsets_raw = msg[i].decode("ascii") if len(msg) > i and msg[i] != b"" else ""
+        rounds_raw = (
+            msg[i + 1].decode("ascii") if len(msg) > i + 1 and msg[i + 1] != b"" else ""
+        )
+        ends_raw = (
+            msg[i + 2].decode("ascii") if len(msg) > i + 2 and msg[i + 2] != b"" else ""
+        )
         if not offsets_raw and not rounds_raw and not ends_raw:
             return None
         return cls(
@@ -468,12 +475,17 @@ class StagingRegisterInfo:
     total_size: int = 0
 
     @classmethod
-    def from_zmq_fields(cls, msg: list) -> Optional["StagingRegisterInfo"]:
+    def from_zmq_fields(
+        cls, msg: list, msg_start_offset: int
+    ) -> Optional["StagingRegisterInfo"]:
+        i = msg_start_offset
         base_ptr = (
-            struct.unpack("Q", msg[12])[0] if len(msg) > 12 and len(msg[12]) == 8 else 0
+            struct.unpack("Q", msg[i])[0] if len(msg) > i and len(msg[i]) == 8 else 0
         )
         total_size = (
-            int(msg[13].decode("ascii")) if len(msg) > 13 and len(msg[13]) > 0 else 0
+            int(msg[i + 1].decode("ascii"))
+            if len(msg) > i + 1 and len(msg[i + 1]) > 0
+            else 0
         )
         if base_ptr == 0 and total_size == 0:
             return None
