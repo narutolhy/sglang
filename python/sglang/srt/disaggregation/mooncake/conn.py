@@ -577,6 +577,9 @@ class MooncakeKVManager(CommonKVManager):
 
         return 0
 
+    # Upper bound for staging buffer: 128MB per thread
+    _MAX_STAGING_BYTES = 128 * 1024 * 1024
+
     def _send_kvcache_slice_staged(
         self,
         mooncake_session_id: str,
@@ -591,9 +594,17 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor = None,
     ) -> int:
         """Pack strided src head slices into contiguous staging buffer using
-        Triton kernel, then do page-level RDMA. Batches kernel launches in
-        chunks to minimize sync overhead while bounding staging buffer size.
-        Within each chunk, per-layer RDMA is submitted concurrently via executor."""
+        Triton kernel, then do page-level RDMA from the contiguous buffer.
+
+        Layers are processed in adaptive-sized chunks:
+        - Triton kernels for the chunk are launched together on the current stream
+        - A stream-level sync ensures GPU packing is complete
+        - Per-layer RDMA within the chunk is submitted concurrently via executor
+
+        Staging buffer safety: the staging buffer is reused across chunks.
+        This is safe because _transfer_data calls batch_transfer_sync which
+        blocks until RDMA completion, and all executor futures are awaited
+        before the next chunk's Triton kernels overwrite the buffer."""
         import torch
 
         num_pages = len(prefill_kv_indices)
@@ -607,11 +618,14 @@ class MooncakeKVManager(CommonKVManager):
         ]
         num_layers_kv = len(layer_ptrs)
 
-        # Staging buffer sized for CHUNK_LAYERS layers to balance between
-        # minimal syncs and bounded memory usage. Thread-local for concurrency.
-        CHUNK_LAYERS = 16
         per_layer_staging = num_pages * packed_page_size
-        staging_layers = min(CHUNK_LAYERS, num_layers_kv)
+        # Adaptive chunk size: fit within _MAX_STAGING_BYTES
+        if per_layer_staging > 0:
+            chunk_layers = max(1, min(num_layers_kv, self._MAX_STAGING_BYTES // per_layer_staging))
+        else:
+            chunk_layers = num_layers_kv
+
+        staging_layers = min(chunk_layers, num_layers_kv)
         staging_size = staging_layers * per_layer_staging
         tid = threading.get_ident()
         if not hasattr(self, '_staging_bufs'):
@@ -628,11 +642,12 @@ class MooncakeKVManager(CommonKVManager):
                 prefill_kv_indices.astype(np.int64), dtype=torch.int64, device=device
             )
             BLOCK_SIZE = triton.next_power_of_2(heads_bytes_per_token)
+            stream = torch.cuda.current_stream(device)
 
-            for chunk_start in range(0, num_layers_kv, CHUNK_LAYERS):
-                chunk_end = min(chunk_start + CHUNK_LAYERS, num_layers_kv)
+            for chunk_start in range(0, num_layers_kv, chunk_layers):
+                chunk_end = min(chunk_start + chunk_layers, num_layers_kv)
 
-                # Launch Triton kernels for this chunk
+                # Launch Triton kernels for this chunk on current stream
                 for i, layer_idx in enumerate(range(chunk_start, chunk_end)):
                     src_layer_ptr = layer_ptrs[layer_idx][0]
                     layer_staging_ptr = staging_ptr + i * per_layer_staging
@@ -644,9 +659,14 @@ class MooncakeKVManager(CommonKVManager):
                         page_size, BLOCK_SIZE=BLOCK_SIZE,
                     )
 
-                torch.cuda.synchronize(self.kv_args.gpu_id)
+                # Stream-level sync: only waits for this stream's kernels,
+                # not unrelated work on other streams
+                stream.synchronize()
 
-                # Per-layer RDMA within chunk via executor (concurrent)
+                # Per-layer RDMA within chunk via executor (concurrent).
+                # _transfer_data calls batch_transfer_sync which blocks until
+                # RDMA completion, so the staging buffer is safe to reuse
+                # after all futures complete.
                 def _transfer_chunk_layer(local_i, layer_idx):
                     dst_layer_ptr = layer_ptrs[layer_idx][1]
                     lsp = staging_ptr + local_i * per_layer_staging
@@ -674,7 +694,7 @@ class MooncakeKVManager(CommonKVManager):
                         if ret != 0:
                             return ret
         else:
-            # Fallback: cudaMemcpy2D
+            # Fallback: cudaMemcpy2D (slower, kept for non-Triton environments)
             try:
                 cudart = ctypes.CDLL("libcudart.so")
             except OSError:
@@ -696,7 +716,7 @@ class MooncakeKVManager(CommonKVManager):
                     if ret != 0:
                         logger.error(f"cudaMemcpy2D failed with error code {ret}")
                         return -1
-                torch.cuda.synchronize(self.kv_args.gpu_id)
+                torch.cuda.current_stream(device).synchronize()
 
                 layer_blocks = [
                     (staging_ptr + p * packed_page_size,
