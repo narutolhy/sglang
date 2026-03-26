@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -203,8 +204,7 @@ class PrefillBootstrapQueue:
         )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
-            hasattr(kv_manager, "enable_staging")
-            and kv_manager.enable_staging
+            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
             and hasattr(kv_manager, "set_kv_buffer_tensors")
             and not self.is_mla_backend
         ):
@@ -354,13 +354,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
-        from sglang.srt.environ import envs
-
-        if not envs.SGLANG_DISAGG_STAGING_BUFFER.get():
-            return
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
-        if not getattr(kv_mgr, "enable_staging", False):
-            return
         prefetch = getattr(kv_mgr, "_prefetch_staging_reqs", None)
         if prefetch is None:
             return
@@ -389,6 +383,7 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
             # Receive requests
@@ -404,7 +399,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
-                self.maybe_prefetch_staging_for_batch(batch)
+                if self.enable_staging:
+                    self.maybe_prefetch_staging_for_batch(batch)
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -418,6 +414,7 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
             # Receive requests
@@ -433,7 +430,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
-                self.maybe_prefetch_staging_for_batch(batch)
+                if self.enable_staging:
+                    self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:

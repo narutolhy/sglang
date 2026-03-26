@@ -276,8 +276,8 @@ class DecodePreallocQueue:
         self._max_ensure_retries: int = 20  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.kv_manager = self._init_kv_manager()
-        self.transfer_queue._init_staging_handler()
 
         if self.scheduler.tp_worker.is_hybrid_swa:
             # FIXME: current SWA allocation allocate full kv cache size in prefill
@@ -354,7 +354,7 @@ class DecodePreallocQueue:
             self.is_mla_backend,
         )
         # Staging buffer setup (only when heterogeneous TP staging is enabled)
-        if getattr(kv_manager, "enable_staging", False) and not self.is_mla_backend:
+        if self.enable_staging and not self.is_mla_backend:
             kv_pool_for_heads = self.token_to_kv_pool
             if hasattr(kv_pool_for_heads, "full_kv_pool"):
                 kv_pool_for_heads = kv_pool_for_heads.full_kv_pool
@@ -370,7 +370,6 @@ class DecodePreallocQueue:
                     )
             kv_manager.prefill_attn_tp_size = 0
             kv_manager.prefill_chunked_prefill_size = 0
-            self.scheduler._decode_kv_manager = kv_manager
         return kv_manager
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
@@ -606,7 +605,8 @@ class DecodePreallocQueue:
                     self.kv_manager.prefill_chunked_prefill_size = (
                         original_cps // prefill_dp
                     )
-                    self.transfer_queue._init_staging_handler()
+                    if self.enable_staging:
+                        self.transfer_queue._init_staging_handler()
 
             need_query: List[Req] = []
             for req in reqs:
@@ -763,7 +763,7 @@ class DecodePreallocQueue:
             decode_req.kv_receiver.init(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
-            if self.transfer_queue.staging_handler is not None:
+            if self.enable_staging and self.transfer_queue.staging_handler is not None:
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
@@ -893,6 +893,7 @@ class DecodeTransferQueue:
         self.scheduler = scheduler
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
 
     def add(self, decode_req: DecodeRequest) -> None:
@@ -900,7 +901,7 @@ class DecodeTransferQueue:
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
-        if self.staging_handler is not None:
+        if self.enable_staging and self.staging_handler is not None:
             for dr in decode_reqs:
                 self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
@@ -1002,22 +1003,23 @@ class DecodeTransferQueue:
 
     def _init_staging_handler(self):
         """Create staging handler if heterogeneous TP staging is active."""
+        if self.staging_handler is not None:
+            return
         from sglang.srt.disaggregation.common.staging_handler import (
             DecodeStagingHandler,
         )
 
+        kv_mgr = self.scheduler.disagg_decode_prealloc_queue.kv_manager
         self.staging_handler = DecodeStagingHandler.try_create(
-            self.scheduler, self.tp_rank
+            kv_mgr, self.scheduler, self.tp_rank
         )
-        kv_mgr = getattr(self.scheduler, "_decode_kv_manager", None)
-        if kv_mgr is not None:
-            kv_mgr._staging_handler = self.staging_handler
+        kv_mgr._staging_handler = self.staging_handler
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
 
-        if self.staging_handler is not None:
+        if self.enable_staging and self.staging_handler is not None:
             polls = self._poll_with_staging()
         else:
             polls = poll_and_all_reduce(
@@ -1077,7 +1079,7 @@ class DecodeTransferQueue:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
         for i in indices_to_remove:
-            if self.staging_handler is not None:
+            if self.enable_staging and self.staging_handler is not None:
                 self.staging_handler.unregister_decode_req(
                     self.queue[i].req.bootstrap_room
                 )

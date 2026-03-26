@@ -236,7 +236,6 @@ class MooncakeKVManager(CommonKVManager):
                             if self.enable_staging and self._staging_ctx.buffers
                             else None
                         ),
-                        i,
                     ),
                     daemon=True,
                 ).start()
@@ -245,8 +244,8 @@ class MooncakeKVManager(CommonKVManager):
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_allocator()
-            self._staging_handler = None
-            self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
+                self._staging_handler = None
+                self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
             self.start_decode_thread()
 
     def init_engine(self):
@@ -338,7 +337,7 @@ class MooncakeKVManager(CommonKVManager):
 
         return PrefillStagingStrategy(self, staging_buffer)
 
-    def _send_chunk_ready(self, req, chunk_idx, kv_chunk, local_rank):
+    def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank):
         """Notify decode that a non-last staging chunk RDMA is complete."""
         try:
             na = NetworkAddress(req.endpoint, req.dst_port)
@@ -353,7 +352,7 @@ class MooncakeKVManager(CommonKVManager):
                     str(kv_chunk.index_slice.start).encode("ascii"),
                     str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
                     req.mooncake_session_id.encode("ascii"),
-                    str(local_rank).encode("ascii"),
+                    str(prefill_unique_rank).encode("ascii"),
                 ]
             )
         except Exception:
@@ -368,7 +367,7 @@ class MooncakeKVManager(CommonKVManager):
         chunked_dst_kv_indice,
         executor,
         queue,
-        local_rank,
+        prefill_unique_rank,
     ):
         """Execute staging transfer for one chunk. Returns (ret, deferred).
 
@@ -414,7 +413,7 @@ class MooncakeKVManager(CommonKVManager):
                 executor,
             )
         elif ret == 0 and not kv_chunk.is_last_chunk:
-            self._send_chunk_ready(req, chunk_idx, kv_chunk, local_rank)
+            self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
         return (ret, False)
 
     def _prefetch_staging_reqs(self, room: int):
@@ -1069,7 +1068,6 @@ class MooncakeKVManager(CommonKVManager):
         queue: FastQueue,
         executor: concurrent.futures.ThreadPoolExecutor,
         staging_buffer=None,
-        worker_id: int = 0,
     ):
         staging_strategy = None
 
@@ -1095,7 +1093,6 @@ class MooncakeKVManager(CommonKVManager):
                     + self.pp_rank * self.attn_cp_size
                     + self.attn_cp_rank
                 )
-                local_rank = prefill_unique_rank
                 staging_deferred = False
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
@@ -1157,7 +1154,7 @@ class MooncakeKVManager(CommonKVManager):
                                 chunked_dst_kv_indice,
                                 executor,
                                 queue,
-                                local_rank,
+                                prefill_unique_rank,
                             )
                             if deferred:
                                 staging_deferred = True

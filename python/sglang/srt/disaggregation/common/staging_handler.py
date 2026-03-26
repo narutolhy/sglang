@@ -84,9 +84,10 @@ class DecodeStagingHandler:
         self._room_to_decode_req: dict = {}
 
     @classmethod
-    def try_create(cls, scheduler, tp_rank: int) -> Optional["DecodeStagingHandler"]:
+    def try_create(
+        cls, kv_manager, scheduler, tp_rank: int
+    ) -> Optional["DecodeStagingHandler"]:
         """Factory: create handler if staging is enabled and heterogeneous TP detected."""
-        kv_manager = getattr(scheduler, "_decode_kv_manager", None)
         if kv_manager is None:
             return None
         _stg = getattr(kv_manager, "_staging_ctx", None)
