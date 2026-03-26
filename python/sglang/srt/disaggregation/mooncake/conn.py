@@ -609,7 +609,8 @@ class MooncakeKVManager(CommonKVManager):
 
         num_pages = len(prefill_kv_indices)
         packed_page_size = page_size * heads_bytes_per_token
-        device = f"cuda:{self.kv_args.gpu_id}"
+        gpu_id = self.kv_args.gpu_id
+        device = torch.device("cuda", gpu_id)
 
         layer_ptrs = [
             (src_k_ptrs[i], dst_k_ptrs[i]) for i in range(layers_current_pp_stage)
@@ -627,6 +628,9 @@ class MooncakeKVManager(CommonKVManager):
 
         staging_layers = min(chunk_layers, num_layers_kv)
         staging_size = staging_layers * per_layer_staging
+        # Thread-local staging buffer cache. Each transfer worker thread keeps
+        # the largest buffer it has ever needed, registered with mooncake.
+        # This is a long-lived GPU memory cost (one buffer per worker thread).
         tid = threading.get_ident()
         if not hasattr(self, '_staging_bufs'):
             self._staging_bufs = {}
