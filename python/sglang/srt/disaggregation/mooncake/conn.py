@@ -529,6 +529,7 @@ class MooncakeKVManager(CommonKVManager):
                 src_kv_item_len, dst_kv_item_len,
                 page_size, bytes_per_token_on_prefill,
                 heads_bytes_per_token_to_send, src_head_slice_offset,
+                executor,
             )
 
         # Fallback: per-token slicing with concurrent per-layer transfers
@@ -587,10 +588,12 @@ class MooncakeKVManager(CommonKVManager):
         src_kv_item_len: int, dst_kv_item_len: int,
         page_size: int, bytes_per_token_on_prefill: int,
         heads_bytes_per_token: int, src_head_offset: int,
+        executor: concurrent.futures.ThreadPoolExecutor = None,
     ) -> int:
         """Pack strided src head slices into contiguous staging buffer using
         Triton kernel, then do page-level RDMA. Batches kernel launches in
-        chunks to minimize sync overhead while bounding staging buffer size."""
+        chunks to minimize sync overhead while bounding staging buffer size.
+        Within each chunk, per-layer RDMA is submitted concurrently via executor."""
         import torch
 
         num_pages = len(prefill_kv_indices)
@@ -629,6 +632,7 @@ class MooncakeKVManager(CommonKVManager):
             for chunk_start in range(0, num_layers_kv, CHUNK_LAYERS):
                 chunk_end = min(chunk_start + CHUNK_LAYERS, num_layers_kv)
 
+                # Launch Triton kernels for this chunk
                 for i, layer_idx in enumerate(range(chunk_start, chunk_end)):
                     src_layer_ptr = layer_ptrs[layer_idx][0]
                     layer_staging_ptr = staging_ptr + i * per_layer_staging
@@ -642,19 +646,33 @@ class MooncakeKVManager(CommonKVManager):
 
                 torch.cuda.synchronize(self.kv_args.gpu_id)
 
-                chunk_blocks = []
-                for i, layer_idx in enumerate(range(chunk_start, chunk_end)):
+                # Per-layer RDMA within chunk via executor (concurrent)
+                def _transfer_chunk_layer(local_i, layer_idx):
                     dst_layer_ptr = layer_ptrs[layer_idx][1]
-                    layer_staging_ptr = staging_ptr + i * per_layer_staging
-                    for p, d in enumerate(dst_kv_indices):
-                        chunk_blocks.append((
-                            layer_staging_ptr + p * packed_page_size,
-                            dst_layer_ptr + int(d) * dst_kv_item_len,
-                            packed_page_size,
-                        ))
-                ret = self._transfer_data(mooncake_session_id, chunk_blocks)
-                if ret != 0:
-                    return ret
+                    lsp = staging_ptr + local_i * per_layer_staging
+                    blocks = [
+                        (lsp + p * packed_page_size,
+                         dst_layer_ptr + int(d) * dst_kv_item_len,
+                         packed_page_size)
+                        for p, d in enumerate(dst_kv_indices)
+                    ]
+                    return self._transfer_data(mooncake_session_id, blocks)
+
+                if executor is not None:
+                    futures = []
+                    for i, layer_idx in enumerate(range(chunk_start, chunk_end)):
+                        futures.append(executor.submit(_transfer_chunk_layer, i, layer_idx))
+                    for future in concurrent.futures.as_completed(futures):
+                        ret = future.result()
+                        if ret != 0:
+                            for f in futures:
+                                f.cancel()
+                            return ret
+                else:
+                    for i, layer_idx in enumerate(range(chunk_start, chunk_end)):
+                        ret = _transfer_chunk_layer(i, layer_idx)
+                        if ret != 0:
+                            return ret
         else:
             # Fallback: cudaMemcpy2D
             try:
