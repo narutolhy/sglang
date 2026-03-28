@@ -62,7 +62,6 @@ class DecodeStagingHandler:
         kv_manager,
         staging_allocator,
         kv_buffer_info: dict,
-        prefill_tp: int,
         decode_tp: int,
         total_kv_heads: int,
         tp_rank: int,
@@ -71,23 +70,33 @@ class DecodeStagingHandler:
         self.kv_manager = kv_manager
         self.staging_allocator = staging_allocator
         self.kv_buffer_info = kv_buffer_info
-        self.prefill_tp = prefill_tp
         self.decode_tp = decode_tp
         self.total_kv_heads = total_kv_heads
         self.tp_rank = tp_rank
         self.scheduler = scheduler
-        self.num_writers = (
-            self.prefill_tp // max(1, self.decode_tp)
-            if self.prefill_tp > self.decode_tp
-            else 1
-        )
         self._room_to_decode_req: dict = {}
+        self._wm_subscribers: dict = {}
+
+    def register_wm_subscriber(self, receiver, session_id: str) -> None:
+        """Register a prefill's bootstrap connection for watermark broadcasts."""
+        if receiver is None or not getattr(receiver, "bootstrap_infos", None):
+            return
+        key = tuple(str(bi) for bi in receiver.bootstrap_infos)
+        if key not in self._wm_subscribers:
+            self._wm_subscribers[key] = (receiver, session_id)
+
+    def num_writers_for(self, decode_req) -> int:
+        """Compute num_writers for a specific request based on its prefill TP."""
+        prefill_tp = decode_req.prefill_attn_tp_size
+        if prefill_tp > self.decode_tp:
+            return prefill_tp // max(1, self.decode_tp)
+        return 1
 
     @classmethod
     def try_create(
         cls, kv_manager, scheduler, tp_rank: int
     ) -> Optional["DecodeStagingHandler"]:
-        """Factory: create handler if staging is enabled and heterogeneous TP detected."""
+        """Factory: create handler if staging infra is available."""
         if kv_manager is None:
             return None
         _stg = getattr(kv_manager, "_staging_ctx", None)
@@ -97,10 +106,7 @@ class DecodeStagingHandler:
         kv_buffer_info = getattr(kv_manager, "kv_buffer_tensors", None)
         if kv_buffer_info is None:
             return None
-        prefill_tp = getattr(kv_manager, "prefill_attn_tp_size", 0)
         decode_tp = kv_manager.attn_tp_size
-        if prefill_tp == 0 or prefill_tp == decode_tp:
-            return None
 
         from sglang.srt.disaggregation.common.staging_buffer import (
             resolve_total_kv_heads,
@@ -111,7 +117,6 @@ class DecodeStagingHandler:
             kv_manager=kv_manager,
             staging_allocator=staging_allocator,
             kv_buffer_info=kv_buffer_info,
-            prefill_tp=prefill_tp,
             decode_tp=decode_tp,
             total_kv_heads=total_kv_heads,
             tp_rank=tp_rank,
@@ -153,7 +158,7 @@ class DecodeStagingHandler:
         chunk_infos = getattr(decode_req.kv_receiver, "chunk_staging_infos", [])
         if chunk_idx >= len(chunk_infos):
             return False
-        alloc_id, staging_offset, _, _ = chunk_infos[chunk_idx]
+        alloc_id, staging_offset, _, _, _ = chunk_infos[chunk_idx]
         if staging_offset < 0 or alloc_id < 0:
             return False
 
@@ -164,7 +169,7 @@ class DecodeStagingHandler:
             if not hasattr(decode_req, "_chunk_events"):
                 decode_req._chunk_events = []
             decode_req._chunk_events.append((event, alloc_id))
-            chunk_infos[chunk_idx] = (-1, -1, 0, -1)
+            chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
         else:
             logger.warning(
                 "submit_chunk_scatter failed room=%s chunk_idx=%s tp_rank=%s",
@@ -173,6 +178,10 @@ class DecodeStagingHandler:
                 self.tp_rank,
             )
         return ok
+
+    def is_staging_room(self, room: int) -> bool:
+        """Check if a room is registered for staging scatter."""
+        return room in self._room_to_decode_req
 
     def submit_last_scatter_async(self, room: int) -> bool:
         """Submit scatter for the last chunk when all ranks report Success.
@@ -276,6 +285,7 @@ class DecodeStagingHandler:
         req_pool_idx = decode_req.req.req_pool_idx
         token_start = page_start * page_size
         token_end = token_start + num_pages * page_size
+        prefill_tp = decode_req.prefill_attn_tp_size
 
         with torch.cuda.stream(scatter_stream):
             kv_indices = self.scheduler.req_to_token_pool.req_to_token[
@@ -292,7 +302,7 @@ class DecodeStagingHandler:
                 v_buffers,
                 page_idx_tensor,
                 page_size,
-                self.prefill_tp,
+                prefill_tp,
                 self.decode_tp,
                 dst_tp_rank,
                 self.total_kv_heads,
@@ -308,23 +318,14 @@ class DecodeStagingHandler:
             return -1
 
         last_info = chunk_infos[-1]
-        alloc_id, staging_offset, _, _ = last_info
+        alloc_id, staging_offset, _, _, last_num_pages = last_info
         if staging_offset < 0 or alloc_id < 0:
             return -1
 
         seq_len = len(decode_req.req.origin_input_ids)
         ps = self.scheduler.token_to_kv_pool_allocator.page_size
         total_pages = (seq_len + ps - 1) // ps
-
-        n = len(chunk_infos)
-        prefill_cps = (
-            getattr(self.kv_manager, "prefill_chunked_prefill_size", None)
-            or self.scheduler.server_args.chunked_prefill_size
-            or 8192
-        )
-        chunk_pages = max(1, prefill_cps // ps)
-        page_start = chunk_pages * (n - 1)
-        last_num_pages = total_pages - page_start
+        page_start = total_pages - last_num_pages
 
         ok = self._scatter_region(
             staging_offset, page_start, last_num_pages, decode_req
@@ -334,24 +335,21 @@ class DecodeStagingHandler:
     def _free_and_send_watermark(
         self, alloc_id: int, decode_req: "DecodeRequest"
     ) -> None:
-        """Free a staging allocation and send watermark to prefill."""
+        """Free a staging allocation and broadcast watermark to all prefills."""
         self.staging_allocator.free(alloc_id)
         post_wm = self.staging_allocator.get_watermark()
-        receiver = decode_req.kv_receiver
-        if receiver is not None and receiver.bootstrap_infos:
-            wm_round, wm_tail = post_wm
-            session_id = receiver.session_id
+        room = decode_req.req.bootstrap_room
+        wm_round, wm_tail = post_wm
+        wm_round_b = str(wm_round).encode("ascii")
+        wm_tail_b = str(wm_tail).encode("ascii")
+        for _key, (receiver, session_id) in list(self._wm_subscribers.items()):
+            sid_b = session_id.encode("ascii")
             for bootstrap_info in receiver.bootstrap_infos:
                 try:
                     sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
                     with lock:
                         sock.send_multipart(
-                            [
-                                b"WATERMARK",
-                                str(wm_round).encode("ascii"),
-                                str(wm_tail).encode("ascii"),
-                                session_id.encode("ascii"),
-                            ]
+                            [b"WATERMARK", wm_round_b, wm_tail_b, sid_b]
                         )
                 except Exception:
                     pass
@@ -368,50 +366,6 @@ def is_watermark_ready(
     return prev_round < wm_round or (prev_round == wm_round and alloc_end <= wm_tail)
 
 
-def allocate_chunk_staging_for_receiver(kv_mgr, kv_indices) -> list:
-    """Allocate per-chunk staging regions from the ring buffer allocator."""
-    _stg = getattr(kv_mgr, "_staging_ctx", None)
-    staging_allocator = getattr(_stg, "allocator", None) if _stg else None
-    if staging_allocator is None:
-        return []
-
-    from sglang.srt.disaggregation.common.staging_buffer import (
-        allocate_chunk_staging,
-        resolve_total_kv_heads,
-    )
-
-    page_size = kv_mgr.kv_args.page_size
-    kv_item_lens = kv_mgr.kv_args.kv_item_lens
-    num_kv_layers = len(kv_item_lens) // 2
-    decode_bytes_per_token = kv_item_lens[0] // page_size
-    attn_tp_size = kv_mgr.attn_tp_size
-    prefill_attn_tp = getattr(kv_mgr, "prefill_attn_tp_size", attn_tp_size)
-    total_kv_heads = resolve_total_kv_heads(kv_mgr.kv_args, attn_tp_size)
-    dst_heads_per_rank = max(1, total_kv_heads // max(1, attn_tp_size))
-    bytes_per_head_per_token = decode_bytes_per_token // dst_heads_per_rank
-    dst_tp_rank = kv_mgr.kv_args.engine_rank % max(1, attn_tp_size)
-
-    chunked_prefill_size = (
-        getattr(kv_mgr, "prefill_chunked_prefill_size", None)
-        or kv_mgr.server_args.chunked_prefill_size
-        or 8192
-    )
-    chunk_pages = max(1, chunked_prefill_size // page_size)
-
-    return allocate_chunk_staging(
-        staging_allocator,
-        len(kv_indices),
-        page_size,
-        chunk_pages,
-        prefill_attn_tp,
-        attn_tp_size,
-        dst_tp_rank,
-        total_kv_heads,
-        bytes_per_head_per_token,
-        num_kv_layers,
-    )
-
-
 # ======================================================================
 # Mooncake-specific staging protocol and utilities
 # ======================================================================
@@ -425,12 +379,6 @@ class StagingTransferInfo:
     rounds: List[int] = dataclasses.field(default_factory=lambda: [0])
     ends: List[int] = dataclasses.field(default_factory=lambda: [-1])
 
-    @staticmethod
-    def _parse_csv_ints(raw: str, default: int) -> List[int]:
-        if not raw or raw == "":
-            return [default]
-        return [int(x) for x in raw.split(",")]
-
     def set_chunk(self, idx: int, offset: int, rnd: int, end: int):
         while len(self.offsets) <= idx:
             self.offsets.append(-1)
@@ -439,33 +387,6 @@ class StagingTransferInfo:
         self.offsets[idx] = offset
         self.rounds[idx] = rnd
         self.ends[idx] = end
-
-    def to_zmq_fields(self) -> Tuple[bytes, bytes, bytes]:
-        return (
-            ",".join(str(x) for x in self.offsets).encode("ascii"),
-            ",".join(str(x) for x in self.rounds).encode("ascii"),
-            ",".join(str(x) for x in self.ends).encode("ascii"),
-        )
-
-    @classmethod
-    def from_zmq_fields(
-        cls, msg: list, msg_start_offset: int
-    ) -> Optional["StagingTransferInfo"]:
-        i = msg_start_offset
-        offsets_raw = msg[i].decode("ascii") if len(msg) > i and msg[i] != b"" else ""
-        rounds_raw = (
-            msg[i + 1].decode("ascii") if len(msg) > i + 1 and msg[i + 1] != b"" else ""
-        )
-        ends_raw = (
-            msg[i + 2].decode("ascii") if len(msg) > i + 2 and msg[i + 2] != b"" else ""
-        )
-        if not offsets_raw and not rounds_raw and not ends_raw:
-            return None
-        return cls(
-            offsets=cls._parse_csv_ints(offsets_raw, -1),
-            rounds=cls._parse_csv_ints(rounds_raw, 0),
-            ends=cls._parse_csv_ints(ends_raw, -1),
-        )
 
 
 @dataclasses.dataclass
@@ -672,7 +593,7 @@ def handle_staging_req(
     infos = getattr(receiver, "chunk_staging_infos", [])
 
     if chunk_idx < len(infos) and infos[chunk_idx][0] >= 0:
-        _, offset, rnd, end = infos[chunk_idx]
+        _, offset, rnd, end, _ = infos[chunk_idx]
     elif (
         chunk_idx < len(infos)
         and infos[chunk_idx][1] == StagingAllocator.ALLOC_OVERSIZED
@@ -715,14 +636,20 @@ def handle_staging_req(
             )
             offset, rnd, end = StagingAllocator.ALLOC_OVERSIZED, 0, -1
             while len(infos) <= chunk_idx:
-                infos.append((-1, -1, 0, -1))
-            infos[chunk_idx] = (-1, StagingAllocator.ALLOC_OVERSIZED, 0, -1)
+                infos.append((-1, -1, 0, -1, 0))
+            infos[chunk_idx] = (
+                -1,
+                StagingAllocator.ALLOC_OVERSIZED,
+                0,
+                -1,
+                chunk_num_pages,
+            )
         else:
             alloc_id, offset, rnd = result
             end = offset + required
             while len(infos) <= chunk_idx:
-                infos.append((-1, -1, 0, -1))
-            infos[chunk_idx] = (alloc_id, offset, rnd, end)
+                infos.append((-1, -1, 0, -1, 0))
+            infos[chunk_idx] = (alloc_id, offset, rnd, end, chunk_num_pages)
 
     bootstrap_infos = room_bootstrap.get(room)
     if bootstrap_infos:

@@ -108,7 +108,6 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
-            staging=StagingTransferInfo.from_zmq_fields(msg, 8),
         )
 
 
@@ -308,16 +307,34 @@ class MooncakeKVManager(CommonKVManager):
             handle_staging_req,
         )
 
+        room = int(msg[1].decode("ascii"))
+        session_id = msg[4].decode("ascii")
+        handler = self._staging_handler
+        assert (
+            handler is not None
+        ), "STAGING_REQ received before staging handler initialized"
+        decode_req = handler._room_to_decode_req.get(room)
+        if decode_req is None:
+            logger.warning(
+                "STAGING_REQ received for unregistered room=%s, skipping",
+                room,
+            )
+            return
+        prefill_tp = decode_req.prefill_attn_tp_size
         handle_staging_req(
             msg,
             self._staging_ctx.allocator,
             self.kv_args,
             self.attn_tp_size,
-            getattr(self, "prefill_attn_tp_size", self.attn_tp_size),
+            prefill_tp,
             getattr(self, "kv_buffer_tensors", None),
             self._staging_ctx.room_receivers,
             self._staging_ctx.room_bootstrap,
         )
+
+        receiver = self._staging_ctx.room_receivers.get(room)
+        if receiver is not None:
+            handler.register_wm_subscriber(receiver, session_id)
 
     def _is_watermark_ready(
         self, session_id: str, alloc_round: int, alloc_end: int
@@ -374,6 +391,7 @@ class MooncakeKVManager(CommonKVManager):
         Handles readiness check, transfer, fallback, and CHUNK_READY notification.
         deferred=True means caller should re-enqueue and break.
         """
+        _tp = self.attn_tp_rank
         ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
             req,
             kv_chunk.index_slice.start,
@@ -400,7 +418,8 @@ class MooncakeKVManager(CommonKVManager):
         )
         if ret == -1:
             logger.warning(
-                f"[Staging] Falling back to per-token slice path (room={kv_chunk.room})"
+                f"[Staging][tp{_tp}] Falling back to per-token slice path "
+                f"(room={kv_chunk.room})"
             )
             ret = self.send_kvcache_slice(
                 req.mooncake_session_id,
@@ -418,6 +437,17 @@ class MooncakeKVManager(CommonKVManager):
 
     def _prefetch_staging_reqs(self, room: int):
         if not self.enable_staging or self.kv_buffer_tensors is None:
+            return
+
+        room_infos = self.transfer_infos.get(room, {})
+        needs_staging = any(
+            not tinfo.is_dummy
+            and self.decode_kv_args_table.get(tinfo.mooncake_session_id) is not None
+            and self.decode_kv_args_table[tinfo.mooncake_session_id].dst_attn_tp_size
+            != self.attn_tp_size
+            for tinfo in room_infos.values()
+        )
+        if not needs_staging:
             return
 
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -1291,6 +1321,13 @@ class MooncakeKVManager(CommonKVManager):
                         tinfo.staging.set_chunk(
                             stg_chunk_idx, stg_offset, stg_round, stg_end
                         )
+                    else:
+                        logger.warning(
+                            "STAGING_RSP RECV but tinfo=None room=%s chunk=%d session=%s",
+                            stg_room,
+                            stg_chunk_idx,
+                            stg_session,
+                        )
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
@@ -1340,13 +1377,24 @@ class MooncakeKVManager(CommonKVManager):
                         (page_start, num_pages, session_id)
                     )
                     handler = self._staging_handler
+                    assert (
+                        handler is not None
+                    ), "CHUNK_READY received before staging handler initialized"
                     writers_arrived = len(self._chunk_writer_counts[room][chunk_idx])
-                    if handler is not None:
-                        if writers_arrived >= handler.num_writers:
-                            handler.submit_chunk_scatter(
-                                room, chunk_idx, page_start, num_pages
-                            )
-                            del self._chunk_writer_counts[room][chunk_idx]
+                    decode_req = handler._room_to_decode_req.get(room)
+                    if decode_req is None:
+                        logger.warning(
+                            "CHUNK_READY received for unregistered room=%s chunk=%d, skipping",
+                            room,
+                            chunk_idx,
+                        )
+                        continue
+                    num_writers = handler.num_writers_for(decode_req)
+                    if writers_arrived >= num_writers:
+                        handler.submit_chunk_scatter(
+                            room, chunk_idx, page_start, num_pages
+                        )
+                        del self._chunk_writer_counts[room][chunk_idx]
                     continue
 
                 # Staging: prefill pre-requests staging allocation before forward
@@ -1371,7 +1419,7 @@ class MooncakeKVManager(CommonKVManager):
                         if arrived_response_num == expected_response_num:
                             if self.enable_staging:
                                 handler = self._staging_handler
-                                if handler is not None:
+                                if handler.is_staging_room(bootstrap_room):
                                     handler.submit_last_scatter_async(bootstrap_room)
                                 self._chunk_writer_counts.pop(bootstrap_room, None)
                             self.update_status(bootstrap_room, KVPoll.Success)
@@ -1702,13 +1750,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     ]
                 )
 
-    def _allocate_chunk_staging(self, kv_indices):
-        from sglang.srt.disaggregation.common.staging_handler import (
-            allocate_chunk_staging_for_receiver,
-        )
-
-        return allocate_chunk_staging_for_receiver(self.kv_mgr, kv_indices)
-
     def init(
         self,
         kv_indices: npt.NDArray[np.int32],
@@ -1731,18 +1772,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
             self.kv_mgr.register_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
             )
-        else:
-            self.chunk_staging_infos = self._allocate_chunk_staging(kv_indices)
-
-        if self.chunk_staging_infos:
-            stg_info = StagingTransferInfo(
-                offsets=[i[1] for i in self.chunk_staging_infos],
-                rounds=[i[2] for i in self.chunk_staging_infos],
-                ends=[i[3] for i in self.chunk_staging_infos],
-            )
-        else:
-            stg_info = StagingTransferInfo()
-        stg_fields = stg_info.to_zmq_fields()
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -1766,7 +1795,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             else b""
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
-                        *stg_fields,
                     ]
                 )
         self.init_time = time.time()

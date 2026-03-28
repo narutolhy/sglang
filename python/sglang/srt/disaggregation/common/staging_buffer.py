@@ -750,52 +750,6 @@ def compute_staging_layout(
     return num_writers, writer_bytes, sum(writer_bytes)
 
 
-def allocate_chunk_staging(
-    allocator,
-    num_pages: int,
-    page_size: int,
-    chunk_pages: int,
-    prefill_attn_tp: int,
-    decode_attn_tp: int,
-    dst_tp_rank: int,
-    total_kv_heads: int,
-    bytes_per_head_per_token: int,
-    num_kv_layers: int,
-) -> List[Tuple[int, int, int, int]]:
-    """Allocate per-chunk staging regions from a StagingAllocator.
-
-    Returns list of (alloc_id, offset, round, end) per chunk.
-    """
-    infos: List[Tuple[int, int, int, int]] = []
-    remaining = num_pages
-    while remaining > 0:
-        cp = min(remaining, chunk_pages)
-        chunk_tokens = cp * page_size
-        _, _, required = compute_staging_layout(
-            prefill_attn_tp,
-            decode_attn_tp,
-            dst_tp_rank,
-            total_kv_heads,
-            chunk_tokens,
-            bytes_per_head_per_token,
-            num_kv_layers,
-        )
-        result = allocator.assign(required)
-        if result is not None:
-            alloc_id, offset, rnd = result
-            infos.append((alloc_id, offset, rnd, offset + required))
-        else:
-            logger.error(
-                "[Staging] allocator returned None: need %d bytes, "
-                "buffer total=%d bytes. Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB.",
-                required,
-                allocator.total_size,
-            )
-            infos.append((-1, StagingAllocator.ALLOC_OVERSIZED, 0, -1))
-        remaining -= cp
-    return infos
-
-
 def resolve_total_kv_heads(
     kv_args,
     attn_tp_size: int,
