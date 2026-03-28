@@ -28,7 +28,6 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
@@ -46,6 +45,7 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     kv_to_page_indices,
     poll_and_all_reduce,
+    poll_and_all_reduce_with_staging,
     prepare_abort,
 )
 from sglang.srt.environ import envs
@@ -983,23 +983,9 @@ class DecodeTransferQueue:
         return True
 
     def _poll_with_staging(self) -> list:
-        """Staging-aware polling: check scatter events, demote incomplete, all_reduce."""
-        for decode_req in self.queue:
-            if decode_req.require_staging and not self.staging_handler.is_done(
-                decode_req
-            ):
-                self.staging_handler.advance_scatter(decode_req)
-
-        raw_polls = [int(dr.kv_receiver.poll()) for dr in self.queue]
-        for i, decode_req in enumerate(self.queue):
-            if raw_polls[i] == int(KVPoll.Success):
-                if decode_req.require_staging and not self.staging_handler.is_done(
-                    decode_req
-                ):
-                    raw_polls[i] = int(KVPoll.Transferring)
-        poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
-        dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=self.gloo_group)
-        return poll_tensor.tolist()
+        return poll_and_all_reduce_with_staging(
+            self.queue, self.staging_handler, self.gloo_group
+        )
 
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
