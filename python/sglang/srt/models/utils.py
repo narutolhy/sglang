@@ -106,11 +106,12 @@ class WeightsMapper:
 
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
-    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+    """Enable fused set_kv_buffer on CUDA with bfloat16 or fp8 KV cache."""
     return (
         _is_cuda
         and hasattr(forward_batch.token_to_kv_pool, "dtype")
-        and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
+        and forward_batch.token_to_kv_pool.dtype
+        in (torch.bfloat16, torch.float8_e4m3fn)
         and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
     )
@@ -128,7 +129,13 @@ def create_fused_set_kv_buffer_arg(
 
     k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
     v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
-    assert layer.k_scale is None and layer.v_scale is None, "scale not supported"
+    # When FP8 KV cache with non-trivial scales, the fused kernel doesn't
+    # handle div(k_scale/v_scale) before quantization. Fall back to unfused.
+    if (
+        k_buffer.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        and layer.k_scale is not None
+    ):
+        return None
     return FusedSetKVBufferArg(
         value=value,
         k_buffer=k_buffer.view(k_buffer.shape[0], -1),

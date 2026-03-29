@@ -9,6 +9,8 @@
 
 #include <dlpack/dlpack.h>
 
+#include <sgl_kernel/math.cuh>
+
 #include <numeric>
 
 namespace {
@@ -134,7 +136,49 @@ __global__ void fused_rope_kernel(const __grid_constant__ FusedRopeParams params
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType, typename IdType, uint32_t kWorkThreads>
+/// Helper: clamp a float to FP8 E4M3 range and cast.
+template <typename CacheDType>
+SGL_DEVICE CacheDType clamp_and_cast_fp8(float val) {
+  return static_cast<CacheDType>(fmaxf(fminf(val, device::math::FP8_E4M3_MAX), -device::math::FP8_E4M3_MAX));
+}
+
+/// Helper: convert an InputStorage (AlignedVector of DType2) to a CacheStorage (AlignedVector of CacheDType)
+/// for storing rope-rotated K values to the KV cache.  When CacheDType == DType this is a no-op passthrough
+/// (the compiler will elide the copy).  When CacheDType is narrower (e.g. fp8_e4m3), we convert via float.
+template <typename CacheDType, typename DType, std::size_t N>
+SGL_DEVICE auto convert_for_cache(const device::AlignedVector<packed_t<DType>, N>& src) {
+  if constexpr (std::is_same_v<CacheDType, DType>) {
+    return src;  // no conversion needed
+  } else {
+    // Element-wise convert DType -> float -> CacheDType
+    device::AlignedVector<CacheDType, N * 2> dst;
+#pragma unroll
+    for (std::size_t j = 0; j < N; ++j) {
+      const auto [f0, f1] = device::cast<fp32x2_t>(src[j]);
+      dst[j * 2 + 0] = clamp_and_cast_fp8<CacheDType>(f0);
+      dst[j * 2 + 1] = clamp_and_cast_fp8<CacheDType>(f1);
+    }
+    return dst;
+  }
+}
+
+/// Helper: convert a VStorage (AlignedVector of DType) to CacheVStorage for V values.
+template <typename CacheDType, typename DType, std::size_t N>
+SGL_DEVICE auto convert_v_for_cache(const device::AlignedVector<DType, N>& src) {
+  if constexpr (std::is_same_v<CacheDType, DType>) {
+    return src;
+  } else {
+    device::AlignedVector<CacheDType, N> dst;
+#pragma unroll
+    for (std::size_t j = 0; j < N; ++j) {
+      const float f = static_cast<float>(src[j]);
+      dst[j] = clamp_and_cast_fp8<CacheDType>(f);
+    }
+    return dst;
+  }
+}
+
+template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType, typename CacheDType, typename IdType, uint32_t kWorkThreads>
 __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStoreParams params) {
   using namespace device;
 
@@ -144,6 +188,14 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
   using InputStorage = AlignedVector<DType2, kVecSize>;
   constexpr int64_t kDimPerThread = kVecSize * 2 * (1 + kIsNeox);
   static_assert(kRopeDim == kDimPerThread * kWorkThreads);
+
+  // Cache output storage types: when CacheDType == DType, these are identical to input types.
+  // When CacheDType is smaller (e.g. fp8), we use element-level storage instead of packed.
+  using CacheKStorage = std::conditional_t<std::is_same_v<CacheDType, DType>,
+      InputStorage, AlignedVector<CacheDType, kVecSize * 2>>;
+  using CacheVStorage = AlignedVector<CacheDType, kRopeDim / kWorkThreads>;
+
+  constexpr int64_t kCacheHeadStrideBytes = kRopeDim * sizeof(CacheDType);
 
   const auto& [base_params, v_ptr, k_cache, v_cache, out_loc, v_stride_bytes, cache_stride_bytes] = params;
   const auto &[
@@ -205,10 +257,12 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
       const auto input_y_out = pointer::offset(input, (kRopeDim / 2) * sizeof(DType));
       store_as<InputStorage>(input_y_out, input_vec_y, lane_id);
       if (!load_q) {
-        const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
-        store_as<InputStorage>(k_out, input_vec_x, lane_id);
-        const auto k_out_y = pointer::offset(k_out, (kRopeDim / 2) * sizeof(DType));
-        store_as<InputStorage>(k_out_y, input_vec_y, lane_id);
+        const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * kCacheHeadStrideBytes);
+        const auto cache_vec_x = convert_for_cache<CacheDType>(input_vec_x);
+        const auto cache_vec_y = convert_for_cache<CacheDType>(input_vec_y);
+        store_as<CacheKStorage>(k_out, cache_vec_x, lane_id);
+        const auto k_out_y = pointer::offset(k_out, (kRopeDim / 2) * sizeof(CacheDType));
+        store_as<CacheKStorage>(k_out_y, cache_vec_y, lane_id);
       }
     } else {
       using CacheStorage = AlignedVector<float, kVecSize>;
@@ -226,8 +280,9 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
       }
       store_as<InputStorage>(input, input_vec, lane_id);
       if (!load_q) {
-        const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
-        store_as<InputStorage>(k_out, input_vec, lane_id);
+        const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * kCacheHeadStrideBytes);
+        const auto cache_vec = convert_for_cache<CacheDType>(input_vec);
+        store_as<CacheKStorage>(k_out, cache_vec, lane_id);
       }
     }
   }
@@ -241,13 +296,14 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
     const auto loc = static_cast<const IdType*>(out_loc)[token_id];
     const auto input = pointer::offset(v_ptr, token_id * v_stride_bytes, head_id * head_stride_bytes);
     const auto input_vec = load_as<VStorage>(input, lane_id);
-    const auto output = pointer::offset(v_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
-    store_as<VStorage>(output, input_vec, lane_id);
+    const auto output = pointer::offset(v_cache, loc * cache_stride_bytes, head_id * kCacheHeadStrideBytes);
+    const auto cache_vec = convert_v_for_cache<CacheDType>(input_vec);
+    store_as<CacheVStorage>(output, cache_vec, lane_id);
   }
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType>
+template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType, typename CacheDType = DType>
 struct FusedRopeKernel {
   static constexpr uint32_t kDimPerThread = std::gcd(16 / sizeof(DType), kRopeDim);
   static constexpr uint32_t kWorkThreads = next_pow2(kRopeDim, kDimPerThread);
@@ -258,7 +314,7 @@ struct FusedRopeKernel {
   template <typename IdType>
   static constexpr auto _kernel_0 = fused_rope_kernel<kIsNeox, kRopeDim, kUsePDL, DType, IdType, kWorkThreads>;
   template <typename IdType>
-  static constexpr auto _kernel_1 = fused_rope_store_kernel<kIsNeox, kRopeDim, kUsePDL, DType, IdType, kWorkThreads>;
+  static constexpr auto _kernel_1 = fused_rope_store_kernel<kIsNeox, kRopeDim, kUsePDL, DType, CacheDType, IdType, kWorkThreads>;
 
   static auto get_num_sm(DLDevice device) {
     static const auto kNumSM = host::runtime::get_sm_count(device.device_id);
@@ -406,7 +462,7 @@ struct FusedRopeKernel {
         .verify(out_loc);
     TensorMatcher({-1, R})  // k_cache
         .with_strides({Dc, 1})
-        .with_dtype<DType>()
+        .with_dtype<DType, CacheDType>()
         .with_device(device)
         .verify(k_cache)
         .verify(v_cache);
@@ -439,11 +495,11 @@ struct FusedRopeKernel {
     };
 
     const auto v_stride_bytes = static_cast<int64_t>(Dv.unwrap() * sizeof(DType));
-    const auto cache_stride_bytes = static_cast<int64_t>(Dc.unwrap() * sizeof(DType));
+    const auto cache_stride_bytes = static_cast<int64_t>(Dc.unwrap() * sizeof(CacheDType));
     const auto store_params = FusedRopeStoreParams{
         .base_params = params,
         .v_ptr = v.data_ptr(),
-        .k_cache = pointer::offset(k_cache.data_ptr(), -k_offset),
+        .k_cache = pointer::offset(k_cache.data_ptr(), -static_cast<int64_t>(num_qo_heads) * kRopeDim * static_cast<int64_t>(sizeof(CacheDType))),
         .v_cache = v_cache.data_ptr(),
         .out_loc = out_loc.data_ptr(),
         .v_stride_bytes = v_stride_bytes,

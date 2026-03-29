@@ -627,21 +627,23 @@ class Qwen3MoeAttention(nn.Module):
                 head_dim=self.head_dim,
                 alt_stream=self.alt_stream,
             )
+            fused_arg = (
+                create_fused_set_kv_buffer_arg(
+                    value=v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                if enable_fused_set_kv_buffer(forward_batch)
+                and self.compatible_with_fused_kv_buffer
+                else None
+            )
             q, k = self.rotary_emb(
                 positions,
                 q,
                 k,
-                fused_set_kv_buffer_arg=(
-                    create_fused_set_kv_buffer_arg(
-                        value=v,
-                        layer=self.attn,
-                        forward_batch=forward_batch,
-                    )
-                    if enable_fused_set_kv_buffer(forward_batch)
-                    and self.compatible_with_fused_kv_buffer
-                    else None
-                ),
+                fused_set_kv_buffer_arg=fused_arg,
             )
+            self._fused_kv_buffer_applied = fused_arg is not None
             self._used_fused_qk_norm_rope_last_call = False
         return q, k, v
 
@@ -677,10 +679,10 @@ class Qwen3MoeAttention(nn.Module):
         q, k, v, fb = inner_state
 
         must_save_kv = self._used_fused_qk_norm_rope_last_call
-        save_kv_cache = must_save_kv or not (
-            enable_fused_set_kv_buffer(forward_batch)
-            and self.compatible_with_fused_kv_buffer
-        )
+        # If fused KV buffer was actually applied in forward_prepare, skip save.
+        # Otherwise (e.g. scale guard returned None), must save via attention.
+        fused_applied = getattr(self, "_fused_kv_buffer_applied", False)
+        save_kv_cache = must_save_kv or not fused_applied
         attn_output = self.attn(
             q,
             k,
