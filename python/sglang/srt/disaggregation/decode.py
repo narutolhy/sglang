@@ -222,8 +222,6 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
-    prefill_attn_tp_size: int = 0
-    require_staging: bool = False
 
     @property
     def seqlen(self) -> int:
@@ -434,18 +432,7 @@ class DecodePreallocQueue:
             bootstrap_room=req.bootstrap_room,
         )
 
-        prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
-        prefill_tp = prefill_info.attn_tp_size if prefill_info else 0
-        decode_tp = self.kv_manager.attn_tp_size
-        decode_req = DecodeRequest(
-            req=req,
-            kv_receiver=kv_receiver,
-            waiting_for_input=False,
-            prefill_attn_tp_size=prefill_tp,
-            require_staging=(
-                self.enable_staging and prefill_tp != 0 and prefill_tp != decode_tp
-            ),
-        )
+        decode_req = DecodeRequest(req=req, kv_receiver=kv_receiver)
         self.queue.append(decode_req)
         return decode_req
 
@@ -770,7 +757,7 @@ class DecodePreallocQueue:
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
             if (
-                decode_req.require_staging
+                decode_req.kv_receiver.require_staging
                 and self.transfer_queue.staging_handler is not None
             ):
                 self.transfer_queue.staging_handler.register_decode_req(
@@ -912,7 +899,7 @@ class DecodeTransferQueue:
         self.queue.extend(decode_reqs)
         if self.enable_staging and self.staging_handler is not None:
             for dr in decode_reqs:
-                if dr.require_staging:
+                if dr.kv_receiver.require_staging:
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
@@ -1076,7 +1063,12 @@ class DecodeTransferQueue:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
         for i in indices_to_remove:
-            if self.queue[i].require_staging and self.staging_handler is not None:
+            if (
+                self.staging_handler is not None
+                and self.staging_handler.is_staging_room(
+                    self.queue[i].req.bootstrap_room
+                )
+            ):
                 self.staging_handler.unregister_decode_req(
                     self.queue[i].req.bootstrap_room
                 )

@@ -320,7 +320,7 @@ class MooncakeKVManager(CommonKVManager):
                 room,
             )
             return
-        prefill_tp = decode_req.prefill_attn_tp_size
+        prefill_tp = decode_req.kv_receiver.prefill_attn_tp_size
         handle_staging_req(
             msg,
             self._staging_ctx.allocator,

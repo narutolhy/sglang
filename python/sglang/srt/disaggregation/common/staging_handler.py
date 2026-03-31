@@ -87,7 +87,7 @@ class DecodeStagingHandler:
 
     def num_writers_for(self, decode_req) -> int:
         """Compute num_writers for a specific request based on its prefill TP."""
-        prefill_tp = decode_req.prefill_attn_tp_size
+        prefill_tp = decode_req.kv_receiver.prefill_attn_tp_size
         if prefill_tp > self.decode_tp:
             return prefill_tp // max(1, self.decode_tp)
         return 1
@@ -285,7 +285,7 @@ class DecodeStagingHandler:
         req_pool_idx = decode_req.req.req_pool_idx
         token_start = page_start * page_size
         token_end = token_start + num_pages * page_size
-        prefill_tp = decode_req.prefill_attn_tp_size
+        prefill_tp = decode_req.kv_receiver.prefill_attn_tp_size
 
         with torch.cuda.stream(scatter_stream):
             kv_indices = self.scheduler.req_to_token_pool.req_to_token[
