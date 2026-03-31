@@ -504,7 +504,6 @@ class CommonKVReceiver(BaseKVReceiver):
         self.target_pp_ranks = None
         self.required_dst_info_num = None
         self.required_prefill_response_num = None
-        self.prefill_attn_tp_size: int = 0
         self.require_staging: bool = False
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
@@ -534,11 +533,10 @@ class CommonKVReceiver(BaseKVReceiver):
             self.required_prefill_response_num
         )
 
-        self.prefill_attn_tp_size = self.prefill_info.attn_tp_size
         if self.kv_mgr.enable_staging:
             self.require_staging = (
-                self.prefill_attn_tp_size != 0
-                and self.prefill_attn_tp_size != self.kv_mgr.attn_tp_size
+                self.prefill_info.attn_tp_size != 0
+                and self.prefill_info.attn_tp_size != self.kv_mgr.attn_tp_size
             )
 
         self.prefill_dp_rank = prefill_dp_rank

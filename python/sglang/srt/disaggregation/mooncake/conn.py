@@ -189,6 +189,7 @@ class MooncakeKVManager(CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -218,7 +219,6 @@ class MooncakeKVManager(CommonKVManager):
             self.enable_custom_mem_pool, self.custom_mem_pool_type = (
                 check_mooncake_custom_mem_pool_enabled()
             )
-            self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
@@ -239,7 +239,6 @@ class MooncakeKVManager(CommonKVManager):
                     daemon=True,
                 ).start()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_allocator()
@@ -273,7 +272,7 @@ class MooncakeKVManager(CommonKVManager):
     # Staging buffer methods (all delegate to staging_handler.py)
     # ------------------------------------------------------------------
 
-    def register_room_bootstrap(self, room, bootstrap_infos, receiver):
+    def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
 
@@ -320,7 +319,7 @@ class MooncakeKVManager(CommonKVManager):
                 room,
             )
             return
-        prefill_tp = decode_req.kv_receiver.prefill_attn_tp_size
+        prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
         handle_staging_req(
             msg,
             self._staging_ctx.allocator,
@@ -1123,6 +1122,8 @@ class MooncakeKVManager(CommonKVManager):
                     + self.pp_rank * self.attn_cp_size
                     + self.attn_cp_rank
                 )
+                # When staging transfer is not yet ready (watermark/allocation pending),
+                # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
@@ -1188,6 +1189,7 @@ class MooncakeKVManager(CommonKVManager):
                             )
                             if deferred:
                                 staging_deferred = True
+                                # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
                         else:
                             ret = self.send_kvcache_slice(
@@ -1771,7 +1773,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             and self.kv_mgr._staging_ctx.allocator is not None
         ):
             self.chunk_staging_infos = []
-            self.kv_mgr.register_room_bootstrap(
+            self.kv_mgr.register_staging_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
             )
 
