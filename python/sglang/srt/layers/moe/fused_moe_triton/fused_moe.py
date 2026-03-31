@@ -47,8 +47,19 @@ _use_sgl_xpu = use_intel_xpu_backend()
 
 from sglang.srt.server_args import get_global_server_args
 
+_JIT_MOE_ALIGN_SORT_BUFFER_CACHE = {}
+
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
+
+    try:
+        from sglang.jit_kernel.fused_silu_mul_quant import (
+            fused_silu_mul_quant as _jit_fused_silu_mul_quant,
+        )
+
+        _HAS_JIT_FUSED = True
+    except ImportError:
+        _HAS_JIT_FUSED = False
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -76,6 +87,39 @@ if not _is_cuda and not _is_hip and not _is_xpu:
         _has_vllm_ops = False
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+
+
+def _get_jit_moe_align_sort_buffers(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int
+):
+    from sglang.jit_kernel.fused_moe_align_sort import (
+        get_fused_moe_align_sort_output_shapes,
+    )
+
+    max_num_tokens_padded, max_num_m_blocks = get_fused_moe_align_sort_output_shapes(
+        topk_ids, block_size, num_experts
+    )
+    device_index = (
+        topk_ids.device.index if topk_ids.device.index is not None else torch.cuda.current_device()
+    )
+    key = (device_index, max_num_tokens_padded, max_num_m_blocks)
+    buffers = _JIT_MOE_ALIGN_SORT_BUFFER_CACHE.get(key)
+    if buffers is None:
+        buffers = (
+            torch.empty(
+                (max_num_tokens_padded,),
+                dtype=torch.int32,
+                device=topk_ids.device,
+            ),
+            torch.empty(
+                (max_num_m_blocks,),
+                dtype=torch.int32,
+                device=topk_ids.device,
+            ),
+            torch.empty((1,), dtype=torch.int32, device=topk_ids.device),
+        )
+        _JIT_MOE_ALIGN_SORT_BUFFER_CACHE[key] = buffers
+    return buffers
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -522,7 +566,20 @@ def fused_experts_impl(
                 )
             elif _is_cuda or _is_hip or _is_xpu:
                 if not filter_expert:
-                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                    if (
+                        _is_cuda
+                        and _HAS_JIT_FUSED
+                        and use_fp8_w8a8
+                        and block_shape is not None
+                    ):
+                        intermediate_cache2, a2_scale = _jit_fused_silu_mul_quant(
+                            intermediate_cache1.view(-1, N),
+                            group_size=block_shape[1],
+                        )
+                    else:
+                        silu_and_mul(
+                            intermediate_cache1.view(-1, N), intermediate_cache2
+                        )
                 else:
                     act_and_mul_triton(
                         intermediate_cache1.view(-1, N),
