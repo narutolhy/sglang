@@ -93,19 +93,20 @@ class DecodeStagingHandler:
         return 1
 
     @classmethod
-    def try_create(
-        cls, kv_manager, scheduler, tp_rank: int
-    ) -> Optional["DecodeStagingHandler"]:
-        """Factory: create handler if staging infra is available."""
-        if kv_manager is None:
-            return None
-        _stg = getattr(kv_manager, "_staging_ctx", None)
-        staging_allocator = getattr(_stg, "allocator", None) if _stg else None
+    def create(cls, kv_manager, scheduler, tp_rank: int) -> "DecodeStagingHandler":
+        """Factory: create handler. Raises if staging infra is missing."""
+        staging_allocator = kv_manager._staging_ctx.allocator
         if staging_allocator is None:
-            return None
-        kv_buffer_info = getattr(kv_manager, "kv_buffer_tensors", None)
+            raise RuntimeError(
+                "Staging is enabled but kv_manager._staging_ctx.allocator is None. "
+                "Check that the transfer backend correctly initializes the staging allocator."
+            )
+        kv_buffer_info = kv_manager.kv_buffer_tensors
         if kv_buffer_info is None:
-            return None
+            raise RuntimeError(
+                "Staging is enabled but kv_manager.kv_buffer_tensors is None. "
+                "Check that set_kv_buffer_tensors() was called during kv_manager init."
+            )
         decode_tp = kv_manager.attn_tp_size
 
         from sglang.srt.disaggregation.common.staging_buffer import (

@@ -757,8 +757,8 @@ class DecodePreallocQueue:
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
             if (
-                decode_req.kv_receiver.require_staging
-                and self.transfer_queue.staging_handler is not None
+                self.transfer_queue.enable_staging
+                and decode_req.kv_receiver.require_staging
             ):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
@@ -897,7 +897,7 @@ class DecodeTransferQueue:
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
-        if self.enable_staging and self.staging_handler is not None:
+        if self.enable_staging:
             for dr in decode_reqs:
                 if dr.kv_receiver.require_staging:
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
@@ -994,7 +994,7 @@ class DecodeTransferQueue:
             DecodeStagingHandler,
         )
 
-        self.staging_handler = DecodeStagingHandler.try_create(
+        self.staging_handler = DecodeStagingHandler.create(
             kv_manager, self.scheduler, self.tp_rank
         )
         kv_manager._staging_handler = self.staging_handler
@@ -1003,7 +1003,7 @@ class DecodeTransferQueue:
         if not self.queue:
             return []
 
-        if self.enable_staging and self.staging_handler is not None:
+        if self.enable_staging:
             polls = self._poll_with_staging()
         else:
             polls = poll_and_all_reduce(
@@ -1063,11 +1063,8 @@ class DecodeTransferQueue:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
         for i in indices_to_remove:
-            if (
-                self.staging_handler is not None
-                and self.staging_handler.is_staging_room(
-                    self.queue[i].req.bootstrap_room
-                )
+            if self.enable_staging and self.staging_handler.is_staging_room(
+                self.queue[i].req.bootstrap_room
             ):
                 self.staging_handler.unregister_decode_req(
                     self.queue[i].req.bootstrap_room
