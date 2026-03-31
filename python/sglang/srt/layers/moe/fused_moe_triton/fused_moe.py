@@ -48,13 +48,14 @@ _use_sgl_xpu = use_intel_xpu_backend()
 from sglang.srt.server_args import get_global_server_args
 
 _JIT_MOE_ALIGN_SORT_BUFFER_CACHE = {}
+_JIT_FUSED_SILU_MUL_QUANT_SCALE_CACHE = {}
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
 
     try:
         from sglang.jit_kernel.fused_silu_mul_quant import (
-            fused_silu_mul_quant as _jit_fused_silu_mul_quant,
+            fused_silu_mul_quant_into as _jit_fused_silu_mul_quant,
         )
 
         _HAS_JIT_FUSED = True
@@ -120,6 +121,31 @@ def _get_jit_moe_align_sort_buffers(
         )
         _JIT_MOE_ALIGN_SORT_BUFFER_CACHE[key] = buffers
     return buffers
+
+
+def _get_jit_fused_silu_mul_quant_scale_buffer(
+    input: torch.Tensor,
+    group_size: int,
+    column_major_scales: bool = False,
+):
+    from sglang.jit_kernel.fused_silu_mul_quant import (
+        get_fused_silu_mul_quant_output_shapes,
+    )
+
+    _, scale_shape = get_fused_silu_mul_quant_output_shapes(
+        input, group_size, column_major_scales
+    )
+    device_index = (
+        input.device.index
+        if input.device.index is not None
+        else torch.cuda.current_device()
+    )
+    key = (device_index, scale_shape, column_major_scales)
+    buffer = _JIT_FUSED_SILU_MUL_QUANT_SCALE_CACHE.get(key)
+    if buffer is None:
+        buffer = torch.empty(scale_shape, dtype=torch.float32, device=input.device)
+        _JIT_FUSED_SILU_MUL_QUANT_SCALE_CACHE[key] = buffer
+    return buffer
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -503,10 +529,17 @@ def fused_experts_impl(
         intermediate_cache1 = cache[: total_tokens * N].view(
             (total_tokens, N),
         )
+        _use_jit_fused = (
+            _is_cuda
+            and _HAS_JIT_FUSED
+            and use_fp8_w8a8
+            and block_shape is not None
+            and not filter_expert
+        )
         intermediate_cache2 = torch.empty(
             (total_tokens, N // 2),
             device=hidden_states.device,
-            dtype=hidden_states.dtype,
+            dtype=torch.float8_e4m3fn if _use_jit_fused else hidden_states.dtype,
         )
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
@@ -566,14 +599,16 @@ def fused_experts_impl(
                 )
             elif _is_cuda or _is_hip or _is_xpu:
                 if not filter_expert:
-                    if (
-                        _is_cuda
-                        and _HAS_JIT_FUSED
-                        and use_fp8_w8a8
-                        and block_shape is not None
-                    ):
-                        intermediate_cache2, a2_scale = _jit_fused_silu_mul_quant(
-                            intermediate_cache1.view(-1, N),
+                    if _use_jit_fused:
+                        jit_input = intermediate_cache1.view(-1, N)
+                        a2_scale = _get_jit_fused_silu_mul_quant_scale_buffer(
+                            jit_input,
+                            group_size=block_shape[1],
+                        )
+                        _jit_fused_silu_mul_quant(
+                            jit_input,
+                            intermediate_cache2,
+                            a2_scale,
                             group_size=block_shape[1],
                         )
                     else:
