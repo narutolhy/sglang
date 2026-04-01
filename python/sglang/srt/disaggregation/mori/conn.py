@@ -856,10 +856,13 @@ class MoriKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        is_last: Optional[bool] = None,
+        cuda_event: Optional[object] = None,
+        skip_aux: bool = False,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
-        is_last = self.curr_idx == self.num_kv_indices
+        is_last = is_last if is_last is not None else (self.curr_idx == self.num_kv_indices)
 
         # Special handling for cp
         if self.kv_mgr.enable_all_cp_ranks_for_transfer:

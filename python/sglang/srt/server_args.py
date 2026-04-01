@@ -696,6 +696,7 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+    enable_pp_disagg_pipeline_kv_transfer: bool = False
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -5746,6 +5747,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+
+        parser.add_argument(
+            "--enable-pp-disagg-pipeline-kv-transfer",
+            action="store_true",
+            help="Enable pipelining KV transfer with downstream PP stage forward computation.",
         )
 
         # Encode prefill disaggregation

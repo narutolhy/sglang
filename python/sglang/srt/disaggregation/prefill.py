@@ -526,7 +526,8 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                self.send_kv_chunk(req, last_chunk=True)
+                if not getattr(req, "disagg_kv_early_sent", False) or self.pp_group.is_last_rank:
+                    self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
                 if req.grammar is not None:
@@ -741,6 +742,7 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        cuda_event: Optional[object] = None,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -809,9 +811,45 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices = kv_to_page_indices(state_indices, page_size)
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
-        if len(page_indices) == 0:
+        if len(page_indices) == 0 and not last_chunk:
             logger.info(
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
-        req.disagg_kv_sender.send(page_indices, state_indices)
+        req.disagg_kv_sender.send(page_indices, state_indices, is_last=last_chunk, cuda_event=cuda_event)
+
+    def trigger_early_kv_transfer(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        cuda_event: Optional[object] = None,
+    ) -> None:
+        """Forward completed: immediately send KV data for non-last PP ranks.
+
+        Only non-last PP ranks send here (with is_last=True, no aux needed).
+        Last PP rank skips — it sends KV + aux together in process_batch_result
+        to avoid serializing two chunks in the transfer worker queue."""
+        if self.pp_group.is_last_rank:
+            return
+        page_size = self.token_to_kv_pool_allocator.page_size
+        for req in batch.reqs:
+            if req.is_chunked <= 0 and not getattr(
+                req, "disagg_kv_early_sent", False
+            ):
+                start_idx = req.start_send_idx
+                end_idx = min(len(req.fill_ids), len(req.origin_input_ids))
+
+                kv_indices = (
+                    self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
+                    .cpu()
+                    .numpy()
+                )
+                req.start_send_idx = end_idx
+
+                page_indices = kv_to_page_indices(kv_indices, page_size)
+                if len(page_indices) > 0:
+                    req.disagg_kv_sender.send(
+                        page_indices, state_indices=None,
+                        is_last=True, cuda_event=cuda_event,
+                        skip_aux=True,
+                    )
+                req.disagg_kv_early_sent = True

@@ -249,6 +249,13 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    # Pipeline KV transfer: enqueue right after forward launch
+                    if (
+                        self.server_args.enable_pp_disagg_pipeline_kv_transfer
+                        and self.server_args.disaggregation_transfer_backend
+                        == "mooncake"
+                    ):
+                        self.trigger_early_kv_transfer(self.cur_batch, cuda_event=self.launch_event)
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(

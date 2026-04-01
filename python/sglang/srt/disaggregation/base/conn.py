@@ -89,9 +89,16 @@ class BaseKVSender(ABC):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        is_last: Optional[bool] = None,
+        cuda_event: Optional[object] = None,
+        skip_aux: bool = False,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
+        If is_last is not None, it overrides the automatic last-chunk detection.
+        If skip_aux is True, aux data is not sent even when is_last=True
+        (used by non-last PP ranks that don't produce aux data).
+        State indices are always sent regardless of skip_aux.
         """
         ...
 

@@ -468,6 +468,9 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        is_last: Optional[bool] = None,
+        cuda_event: Optional[object] = None,
+        skip_aux: bool = False,
     ):
         pass
 

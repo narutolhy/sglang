@@ -59,6 +59,8 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List[int]]
+    cuda_event: Optional[object] = None
+    enqueue_time: float = 0.0
 
 
 from sglang.srt.disaggregation.common.staging_handler import (
@@ -1103,6 +1105,8 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                if kv_chunk.cuda_event is not None:
+                    kv_chunk.cuda_event.synchronize()
                 if (
                     self.enable_staging
                     and staging_strategy is None
@@ -1237,11 +1241,14 @@ class MooncakeKVManager(CommonKVManager):
                                 )
 
                             # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
-                                req,
-                                kv_chunk.prefill_aux_index,
-                                target_rank_registration_info.dst_aux_ptrs,
-                            )
+                            if kv_chunk.prefill_aux_index is not None:
+                                ret = self.send_aux(
+                                    req,
+                                    kv_chunk.prefill_aux_index,
+                                    target_rank_registration_info.dst_aux_ptrs,
+                                )
+                            else:
+                                ret = 0
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
@@ -1498,9 +1505,9 @@ class MooncakeKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        cuda_event: Optional[object] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
         if (
             bootstrap_room not in self.request_status
@@ -1532,6 +1539,8 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                cuda_event=cuda_event,
+                enqueue_time=time.time(),
             )
         )
 
@@ -1588,10 +1597,13 @@ class MooncakeKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        is_last: Optional[bool] = None,
+        cuda_event: Optional[object] = None,
+        skip_aux: bool = False,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
-        is_last_chunk = self.curr_idx == self.num_kv_indices
+        is_last_chunk = is_last if is_last is not None else (self.curr_idx == self.num_kv_indices)
 
         # Special handling for cp
         if self.kv_mgr.enable_all_cp_ranks_for_transfer:
@@ -1613,6 +1625,7 @@ class MooncakeKVSender(CommonKVSender):
                 kv_indices,
                 index_slice,
                 False,
+                cuda_event=cuda_event,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -1620,8 +1633,9 @@ class MooncakeKVSender(CommonKVSender):
                 kv_indices,
                 index_slice,
                 True,
-                aux_index=self.aux_index,
+                aux_index=None if skip_aux else self.aux_index,
                 state_indices=state_indices,
+                cuda_event=cuda_event,
             )
 
     def poll(self) -> KVPoll:
