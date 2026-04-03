@@ -24,10 +24,8 @@ class TestFlashAttention4(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
-            "--prefill-attention-backend",
+            "--attention-backend",
             "fa4",
-            "--decode-attention-backend",
-            "flashinfer",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -70,10 +68,8 @@ class TestFlashAttention4SpeculativeDecodeTopk(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
-            "--prefill-attention-backend",
+            "--attention-backend",
             "fa4",
-            "--decode-attention-backend",
-            "flashinfer",
             "--speculative-algorithm",
             "EAGLE3",
             "--speculative-draft-model-path",
