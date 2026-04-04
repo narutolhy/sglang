@@ -58,13 +58,13 @@ class TestFlashAttention4(unittest.TestCase):
 class TestFlashAttention4SpeculativeDecodeTopk(unittest.TestCase):
     """Test FlashAttention4 with EAGLE3 speculative decoding (topk > 1).
 
-    Verifies that FA4 prefill + EAGLE3 topk > 1 produces correct outputs and
+    Verifies that FA4 + EAGLE3 topk > 1 produces correct outputs and
     achieves meaningful speculative acceptance length.
     """
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen3-8B"
+        cls.model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
@@ -73,7 +73,7 @@ class TestFlashAttention4SpeculativeDecodeTopk(unittest.TestCase):
             "--speculative-algorithm",
             "EAGLE3",
             "--speculative-draft-model-path",
-            "lmsys/sglang-EAGLE3-Qwen3-8B-Instruct",
+            "lmsys/SGLang-EAGLE3-Qwen3-30B-A3B-Instruct-2507-SpecForge-Nex",
             "--speculative-num-steps",
             "5",
             "--speculative-eagle-topk",
