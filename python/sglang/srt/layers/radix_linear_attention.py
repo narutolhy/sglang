@@ -102,7 +102,9 @@ class RadixLinearAttention(nn.Module):
 
 
 @register_custom_op(mutates_args=["output"])
-@register_split_op()
+# Removed @register_split_op() to reduce PCG graph segments for hybrid
+# Mamba models (81 → 51 segments for Qwen3.5). Linear attention is now
+# included inside graph segments, enabling larger fusion opportunities.
 def unified_linear_attention_with_output(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,

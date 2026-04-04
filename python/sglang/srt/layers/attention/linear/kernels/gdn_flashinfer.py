@@ -97,7 +97,19 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             raise RuntimeError("FlashInfer GDN decode kernel is unavailable.")
 
         sm_major = torch.cuda.get_device_capability()[0]
-        self.use_state_pool = sm_major != 9
+        # Enable state pool on SM90 when FlashInfer supports pooled decode.
+        # Eliminates ~1.2ms/step gather/scatter memcpy in CUDA graph replay.
+        import inspect
+        _decode_params = inspect.signature(self._decode_fn).parameters
+        if "initial_state_indices" in _decode_params:
+            self.use_state_pool = True
+            if sm_major == 9:
+                logger.info(
+                    "FlashInfer GDN: enabling pooled decode on SM90 "
+                    "(eliminates gather/scatter memcpy in CUDA graph replay)"
+                )
+        else:
+            self.use_state_pool = sm_major != 9
 
         if sm_major == 9:
             if self._prefill_fn is None:
@@ -186,7 +198,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple:
-        if self.use_state_pool:
+        if self.use_state_pool and torch.cuda.get_device_capability()[0] >= 10:
             raise NotImplementedError(
                 "FlashInfer GDN prefill is not supported on SM100+. "
                 "Use --linear-attn-prefill-backend triton."
@@ -267,7 +279,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        if self.use_state_pool:
+        if self.use_state_pool and torch.cuda.get_device_capability()[0] >= 10:
             raise NotImplementedError(
                 "FlashInfer GDN MTP verify is not yet supported on SM100+."
             )
