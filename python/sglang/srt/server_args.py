@@ -1067,9 +1067,11 @@ class ServerArgs:
         # 1. Disable Model Arch
         if self.get_model_config().is_piecewise_cuda_graph_disabled_model:
             self.disable_piecewise_cuda_graph = True
-        # 2. Speculative decoding
-        if self.speculative_algorithm is not None:
-            self.disable_piecewise_cuda_graph = True
+        # 2. Speculative decoding — no longer disabled.
+        # PCG only handles prefill/extend (ForwardMode.EXTEND).
+        # All speculative algorithms (NEXTN, EAGLE, EAGLE3, NGRAM, etc.)
+        # use decode CUDA graphs (ForwardMode.TARGET_VERIFY) independently.
+        # PCG captures with spec_info=None which is correct for prefill.
         # 3. DP attention
         if self.enable_dp_attention:
             self.disable_piecewise_cuda_graph = True

@@ -417,6 +417,11 @@ class PiecewiseCudaGraphRunner:
         # TODO(yuwei): fix it
         if forward_batch.input_embeds is not None:
             return False
+        # PCG graphs are captured with ForwardMode.EXTEND and spec_info=None.
+        # TARGET_VERIFY has different spec_info and capture_hidden_mode,
+        # so it must not use PCG-captured graphs.
+        if forward_batch.forward_mode.is_target_verify():
+            return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
