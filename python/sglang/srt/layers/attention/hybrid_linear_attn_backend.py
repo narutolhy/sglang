@@ -200,10 +200,10 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
-                if (
-                    forward_batch.mamba_track_mask is not None
-                    and forward_batch.mamba_track_mask.any()
-                ):
+                has_mamba_track = forward_batch.mamba_track_mask is not None
+                if has_mamba_track:
+                    # Downstream code guards with .numel() > 0, so empty
+                    # tensors are safe when no sequences need tracking.
                     track_conv_indices = self._init_track_conv_indices(
                         query_start_loc, forward_batch
                     )
@@ -311,13 +311,13 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_final_src: Source indices into last_recurrent_state buffer (for aligned seqs)
             track_ssm_final_dst: Destination cache slot indices (for aligned seqs)
         """
-        # Move to CPU to avoid kernel launches for masking operations
-        mamba_track_mask = forward_batch.mamba_track_mask.cpu()
-        extend_seq_lens = forward_batch.extend_seq_lens.cpu()
-        mamba_track_indices = forward_batch.mamba_track_indices.cpu()
-        mamba_cache_indices = mamba_cache_indices.cpu()
-        mamba_track_seqlens = forward_batch.mamba_track_seqlens.cpu()
-        prefix_lens = forward_batch.extend_prefix_lens.cpu()
+        # All operations stay on GPU to avoid CPU-GPU sync pipeline stalls.
+        # The tensor ops (cumsum, masking, indexing) are small and fully pipelined.
+        mamba_track_mask = forward_batch.mamba_track_mask
+        extend_seq_lens = forward_batch.extend_seq_lens
+        mamba_track_indices = forward_batch.mamba_track_indices
+        mamba_track_seqlens = forward_batch.mamba_track_seqlens
+        prefix_lens = forward_batch.extend_prefix_lens
 
         # Calculate the number of hidden states per request
         num_h_states = (extend_seq_lens - 1) // FLA_CHUNK_SIZE + 1
@@ -347,12 +347,11 @@ class MambaAttnBackendBase(AttentionBackend):
         )
         track_ssm_h_dst = dst_masked[not_aligned]
 
-        # Move back to GPU
         return (
-            track_ssm_h_src.to(self.device, non_blocking=True),
-            track_ssm_h_dst.to(self.device, non_blocking=True),
-            track_ssm_final_src.to(self.device, non_blocking=True),
-            track_ssm_final_dst.to(self.device, non_blocking=True),
+            track_ssm_h_src,
+            track_ssm_h_dst,
+            track_ssm_final_src,
+            track_ssm_final_dst,
         )
 
     def init_forward_metadata_capture_cuda_graph(
@@ -613,10 +612,7 @@ class MambaAttnBackendBase(AttentionBackend):
         Note: Conv state tracking for extend is handled separately via gather operations
         using indices computed by `_init_track_conv_indices`.
         """
-        if (
-            forward_batch.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask.any()
-        ):
+        if forward_metadata.track_ssm_h_src is not None:
             h = h.squeeze(0)
 
             if forward_metadata.track_ssm_h_src.numel() > 0:
