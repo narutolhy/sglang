@@ -228,9 +228,15 @@ class LlamaAttention(nn.Module):
         use_async_tp: bool = False,
         is_scattered: bool = False,
     ) -> torch.Tensor:
+        num_tokens = positions.shape[0]
+
         # Async TP: fused AllGather+GEMM for qkv_proj when input is scattered
         if use_async_tp and is_scattered:
             qkv, _ = self.qkv_proj(hidden_states, use_fused_all_gather=True)
+            # AG gathers shard_size*tp tokens which may exceed num_tokens
+            # due to padding; truncate to M for attention (KV cache needs exact M)
+            if qkv.shape[0] > num_tokens:
+                qkv = qkv[:num_tokens]
             q, k, v = qkv.split(
                 [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
@@ -253,6 +259,13 @@ class LlamaAttention(nn.Module):
 
         attn_output = self.attn(q, k, v, forward_batch)
         if use_async_tp:
+            # Pad attn_output to nearest multiple of tp_size for GEMM+RS
+            tp_size = get_tensor_model_parallel_world_size()
+            pad_size = (tp_size - attn_output.shape[0] % tp_size) % tp_size
+            if pad_size > 0:
+                attn_output = torch.nn.functional.pad(
+                    attn_output, (0, 0, 0, pad_size)
+                )
             output, _ = self.o_proj(attn_output, use_fused_reduce_scatter=True)
         else:
             output, _ = self.o_proj(attn_output)
@@ -362,9 +375,10 @@ class LlamaDecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward with async TP: GEMM+ReduceScatter / AllGather+GEMM overlap.
 
-        Padding strategy: attention must see exactly M tokens (KV cache indices).
-        GEMM+RS and AG+GEMM need M divisible by tp_size.
-        Solution: pad before GEMM+RS, truncate after AG+GEMM (around attention).
+        Padding is handled inside self_attn.forward() and self.mlp.forward():
+        - AG+GEMM may gather to padded_m > M; qkv is truncated to M for attention
+        - attn_output is padded to nearest multiple of tp_size before GEMM+RS
+        - MLP AG+GEMM and GEMM+RS naturally work on padded sizes
         """
         num_tokens = positions.shape[0]
 
@@ -388,65 +402,46 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states)
             return hidden_states, residual
 
+        # Detect if hidden_states is already scattered from previous layer
         is_scattered = hidden_states.shape[0] != num_tokens
-        pad_size = (self.tp_size - num_tokens % self.tp_size) % self.tp_size
-        padded_m = num_tokens + pad_size
-        shard_size = padded_m // self.tp_size
 
-        # --- Layernorm + residual ---
+        # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        # --- Self Attention ---
-        # qkv_proj: if scattered, AG+GEMM gathers to padded_m, then truncate for attention
-        if is_scattered:
-            qkv, _ = self.self_attn.qkv_proj(
-                hidden_states, use_fused_all_gather=True
-            )
-            # AG gathered shard_size*tp = padded_m tokens; truncate to M for attention
-            if pad_size > 0:
-                qkv = qkv[:num_tokens]
-        else:
-            qkv, _ = self.self_attn.qkv_proj(hidden_states)
-
-        q, k, v = qkv.split(
-            [self.self_attn.q_size, self.self_attn.kv_size, self.self_attn.kv_size],
-            dim=-1,
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            use_async_tp=True,
+            is_scattered=is_scattered,
         )
-        q, k = self.self_attn.rotary_emb(positions, q, k)
-        attn_output = self.self_attn.attn(q, k, v, forward_batch)
-        # attn_output is [M, head*dim/tp]
+        # After o_proj GEMM+RS: hidden_states is [shard_size, H]
+        # where shard_size = ceil(M / tp_size)
 
-        # o_proj GEMM+RS: pad to padded_m before fused op
-        if pad_size > 0:
-            attn_output = torch.nn.functional.pad(attn_output, (0, 0, 0, pad_size))
-        hidden_states, _ = self.self_attn.o_proj(
-            attn_output, use_fused_reduce_scatter=True
-        )
-        # hidden_states is [shard_size, H]
-
-        # Scatter residual to match
+        # Scatter residual to match if not already scattered
         if not is_scattered:
             tp_rank = get_tensor_model_parallel_rank()
+            shard_size = hidden_states.shape[0]
+            # Pad residual if M is not divisible by tp_size
+            pad_size = shard_size * self.tp_size - num_tokens
             if pad_size > 0:
-                residual = torch.nn.functional.pad(residual, (0, 0, 0, pad_size))
+                residual = torch.nn.functional.pad(
+                    residual, (0, 0, 0, pad_size)
+                )
             residual = residual.narrow(0, tp_rank * shard_size, shard_size)
 
-        # --- MLP ---
+        # Fully Connected (both hidden_states and residual are scattered)
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual
         )
-        # gate_up AG+GEMM: shard_size*tp = padded_m → GEMM → [padded_m, intermediate/tp]
-        gate_up, _ = self.mlp.gate_up_proj(
-            hidden_states, use_fused_all_gather=True
+        hidden_states = self.mlp(
+            hidden_states, use_async_tp=True, is_scattered=True
         )
-        x = self.mlp.act_fn(gate_up)
-        # down_proj GEMM+RS: [padded_m, intermediate/tp] → [shard_size, H]
-        hidden_states, _ = self.mlp.down_proj(x, use_fused_reduce_scatter=True)
-
+        # After down_proj GEMM+RS: hidden_states is [shard_size, H]
         return hidden_states, residual
 
 
