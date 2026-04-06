@@ -362,6 +362,27 @@ class LlamaDecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward with async TP: GEMM+ReduceScatter / AllGather+GEMM overlap."""
         num_tokens = positions.shape[0]
+
+        # Fused RS requires M > 0 and M divisible by tp_size. Fall back otherwise.
+        if num_tokens == 0 or num_tokens % self.tp_size != 0:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual
+                )
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+            hidden_states = self.mlp(hidden_states)
+            return hidden_states, residual
+
         is_scattered = hidden_states.shape[0] != num_tokens
 
         # Self Attention
