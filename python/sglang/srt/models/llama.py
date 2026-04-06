@@ -406,9 +406,10 @@ class LlamaDecoderLayer(nn.Module):
         if not is_scattered:
             tp_rank = get_tensor_model_parallel_rank()
             chunk = residual.shape[0] // self.tp_size
-            residual = residual[
-                tp_rank * chunk : (tp_rank + 1) * chunk
-            ].contiguous()
+            # Keep this as a view to avoid a per-layer materializing copy on the
+            # async TP path. The downstream layernorm path handles non-contiguous
+            # residuals, and the final model epilogue gathers back to full shape.
+            residual = residual.narrow(0, tp_rank * chunk, chunk)
 
         # Fully Connected (both hidden_states and residual are [M/tp, H])
         hidden_states, residual = self.post_attention_layernorm(
