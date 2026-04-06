@@ -30,6 +30,7 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.layers.activation import SiluAndMul
+
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -382,8 +383,10 @@ class LlamaDecoderLayer(nn.Module):
         """
         num_tokens = positions.shape[0]
 
-        # M=0: fall back (scheduler warmup sends empty batches)
-        if num_tokens == 0:
+        # Only use async TP for prefill where GEMMs are large enough to
+        # benefit from compute-communication overlap. Decode GEMMs are tiny
+        # (M=1) and the fused op overhead causes 2-3x regression.
+        if num_tokens == 0 or forward_batch.forward_mode.is_decode():
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
