@@ -521,6 +521,7 @@ class ServerArgs:
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
+    enable_async_tp: bool = False
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
     enable_aiter_allreduce_fusion: bool = False
@@ -4925,6 +4926,11 @@ class ServerArgs:
             choices=["default", "bf16"],
             default=ServerArgs.flashinfer_mxfp4_moe_precision,
             help="Choose the computation precision of flashinfer mxfp4 moe",
+        )
+        parser.add_argument(
+            "--enable-async-tp",
+            action="store_true",
+            help="Enable async tensor parallelism with GEMM+ReduceScatter and AllGather+GEMM overlap using torch symmetric memory.",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",

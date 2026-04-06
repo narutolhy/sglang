@@ -452,8 +452,30 @@ class ColumnParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_column_parallel_weight(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, use_fused_all_gather=False):
         bias = self.bias if not self.skip_bias_add else None
+
+        # Async TP: fused AllGather + GEMM path
+        # Input is scattered [M/tp, K], need to gather then GEMM
+        if (
+            use_fused_all_gather
+            and hasattr(self, "weight")
+            and self.tp_size > 1
+        ):
+            from sglang.srt.layers.async_tp import fused_all_gather_matmul
+
+            tp_group = get_tp_group()
+            group_name = tp_group.device_group.group_name
+            _, mm_outputs = fused_all_gather_matmul(
+                input_,
+                [self.weight],
+                group_name,
+            )
+            output = mm_outputs[0]
+            if bias is not None:
+                output = output + bias
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
 
         # Matrix multiply.
         assert self.quant_method is not None
@@ -1489,7 +1511,7 @@ class RowParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False):
+    def forward(self, input_, skip_all_reduce=False, use_fused_reduce_scatter=False):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1503,6 +1525,27 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+
+        # Async TP: fused GEMM + ReduceScatter path
+        # Works regardless of reduce_results — the fused op always does RS.
+        if (
+            use_fused_reduce_scatter
+            and self.tp_size > 1
+            and hasattr(self, "weight")
+        ):
+            from sglang.srt.layers.async_tp import fused_matmul_reduce_scatter
+
+            tp_group = get_tp_group()
+            group_name = tp_group.device_group.group_name
+            output = fused_matmul_reduce_scatter(
+                input_parallel,
+                self.weight,
+                group_name,
+                bias=bias_,
+            )
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
+
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
