@@ -402,8 +402,11 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states)
             return hidden_states, residual
 
-        # Detect if hidden_states is already scattered from previous layer
-        is_scattered = hidden_states.shape[0] != num_tokens
+        # Detect if hidden_states is already scattered from previous layer.
+        # Cannot rely solely on shape when shard_size == num_tokens (e.g. decode M=1).
+        is_scattered = getattr(
+            hidden_states, "_async_tp_scattered", False
+        ) or hidden_states.shape[0] != num_tokens
 
         # Self Attention
         if residual is None:
@@ -441,7 +444,8 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.mlp(
             hidden_states, use_async_tp=True, is_scattered=True
         )
-        # After down_proj GEMM+RS: hidden_states is [shard_size, H]
+        # Mark output as scattered so next layer detects it even if shard_size == M
+        hidden_states._async_tp_scattered = True
         return hidden_states, residual
 
 
@@ -524,9 +528,10 @@ class LlamaModel(nn.Module):
                 }
             )
         else:
-            # Async TP: hidden_states/residual may be scattered [M/tp, H].
+            # Async TP: hidden_states/residual may be scattered [shard_size, H].
             # AllGather back to [M, H] before final norm and LM head.
-            if hidden_states.shape[0] != positions.shape[0]:
+            if getattr(hidden_states, "_async_tp_scattered", False) or \
+                    hidden_states.shape[0] != positions.shape[0]:
                 tp_group = get_tp_group()
                 shard_size = hidden_states.shape[0]
                 gathered_size = shard_size * tp_group.world_size
