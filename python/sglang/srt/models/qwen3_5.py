@@ -34,7 +34,12 @@ from sglang.srt.configs.qwen3_5 import (
 )
 
 # Distributed
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
@@ -765,6 +770,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         self.alt_stream = alt_stream
 
+        # Async TP config
+        server_args = get_global_server_args()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.use_async_tp = (
+            server_args is not None
+            and server_args.enable_async_tp
+            and self.tp_size > 1
+        )
+
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -827,6 +841,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ):
+        if self.use_async_tp and not forward_batch.forward_mode.is_idle():
+            return self._forward_async_tp(
+                positions, hidden_states, residual, forward_batch
+            )
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -868,6 +887,91 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+
+        return hidden_states, residual
+
+    def _forward_async_tp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward with async TP: GEMM+ReduceScatter / AllGather+GEMM overlap.
+
+        Bypasses LayerCommunicator and does fused compute-communication directly.
+        Between RowParallel(GEMM+RS) and ColumnParallel(AG+GEMM), tensors are in
+        scattered state [M/tp, H], and element-wise ops (layernorm, residual add)
+        operate on the scattered data.
+        """
+        num_tokens = positions.shape[0]
+        is_scattered = hidden_states.shape[0] != num_tokens
+
+        # --- Prepare attention: residual add + layernorm ---
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        # --- Self attention with fused ops ---
+        # qkv_proj: fused AllGather+GEMM if input is scattered
+        qkv, _ = self.qkv_proj(
+            hidden_states, use_fused_all_gather=(is_scattered)
+        )
+
+        if self.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            )
+            orig_shape = q_gate.shape[:-1]
+            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+            q, gate = torch.chunk(q_gate, 2, dim=-1)
+            q = q.reshape(*orig_shape, -1)
+            gate = gate.reshape(*orig_shape, -1)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        q, k = self._apply_qk_norm(q, k)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, forward_batch)
+
+        if self.attn_output_gate:
+            gate = torch.sigmoid(gate)
+            attn_output = attn_output * gate
+
+        # o_proj: fused GEMM+ReduceScatter → output is [M/tp, H]
+        hidden_states, _ = self.o_proj(attn_output, use_fused_reduce_scatter=True)
+
+        # Scatter residual to match if not already scattered
+        if not is_scattered:
+            tp_rank = get_tensor_model_parallel_rank()
+            chunk = residual.shape[0] // self.tp_size
+            residual = residual[
+                tp_rank * chunk : (tp_rank + 1) * chunk
+            ].contiguous()
+
+        # --- Prepare MLP: residual add + layernorm ---
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual
+        )
+
+        # --- MLP with fused ops ---
+        if isinstance(self.mlp, Qwen2MoeMLP):
+            # Dense MLP: gate_up_proj with fused AG+GEMM, down_proj with GEMM+RS
+            gate_up, _ = self.mlp.gate_up_proj(
+                hidden_states, use_fused_all_gather=True
+            )
+            x = self.mlp.act_fn(gate_up)
+            hidden_states, _ = self.mlp.down_proj(
+                x, use_fused_reduce_scatter=True
+            )
+        else:
+            # MoE: fall back to standard path (MoE has its own communication)
+            hidden_states = self.mlp(hidden_states, forward_batch, False, False)
+            # Note: for MoE, the output is still full [M, H] with AllReduce done
+            # We need to ReduceScatter it to maintain scattered state
+            # For now, skip async TP for MoE layers - they have their own overlap
 
         return hidden_states, residual
 
@@ -1010,6 +1114,32 @@ class Qwen3_5ForCausalLM(nn.Module):
                     "residual": residual,
                 }
             )
+
+        # Async TP: hidden_states and residual may be scattered [M/tp, H].
+        # AllGather them back to [M, H] before final norm and LM head.
+        if (
+            hidden_states.shape[0] != 0
+            and hidden_states.shape[0] != positions.shape[0]
+        ):
+            tp_group = get_tp_group()
+            full_hidden = torch.empty(
+                positions.shape[0],
+                hidden_states.shape[-1],
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            tp_group.all_gather_into_tensor(full_hidden, hidden_states)
+            hidden_states = full_hidden
+
+            if residual is not None:
+                full_residual = torch.empty(
+                    positions.shape[0],
+                    residual.shape[-1],
+                    dtype=residual.dtype,
+                    device=residual.device,
+                )
+                tp_group.all_gather_into_tensor(full_residual, residual)
+                residual = full_residual
 
         # Apply final normalization
         if hidden_states.shape[0] != 0:

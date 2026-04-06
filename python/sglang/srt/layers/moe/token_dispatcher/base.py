@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import weakref
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Iterator,
     Optional,
     OrderedDict,
     Protocol,
@@ -249,6 +251,27 @@ class CombineInput(Protocol):
     def format(self) -> CombineInputFormat: ...
 
 
+@dataclass(frozen=True)
+class MoeDispatchChunk:
+    """A logical chunk of dispatched MoE work.
+
+    Today the standard path emits a single chunk for the whole batch. This
+    wrapper gives us a stable place to add chunk-local metadata and async state
+    when we start overlapping dispatch/compute/combine.
+    """
+
+    chunk_id: int
+    dispatch_output: DispatchOutput
+
+
+@dataclass(frozen=True)
+class MoeCombineChunk:
+    """The compute result associated with one dispatched MoE chunk."""
+
+    chunk: MoeDispatchChunk
+    combine_input: CombineInput
+
+
 # ------------------------------ Base Dispatcher -------------------------------------
 
 
@@ -282,6 +305,22 @@ class BaseDispatcher(ABC):
     ) -> DispatchOutput:
         pass
 
+    def iter_dispatch_chunks(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+    ) -> Iterator[MoeDispatchChunk]:
+        """Yield dispatched work in pipeline order.
+
+        The default implementation preserves existing behavior by returning one
+        chunk that covers the full input batch.
+        """
+
+        yield MoeDispatchChunk(
+            chunk_id=0,
+            dispatch_output=self.dispatch(
+                hidden_states=hidden_states, topk_output=topk_output
+            ),
+        )
+
     def _dispatch_with_hook(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DispatchOutput:
@@ -304,6 +343,15 @@ class BaseDispatcher(ABC):
     @abstractmethod
     def combine(self, combine_input: CombineInput) -> torch.Tensor:
         pass
+
+    def combine_chunk(self, combine_chunk: MoeCombineChunk) -> torch.Tensor:
+        """Finalize one chunk of computed MoE outputs.
+
+        Future chunked implementations can override this to launch chunk-local
+        reduce-scatter or deferred accumulation without changing call sites.
+        """
+
+        return self.combine(combine_chunk.combine_input)
 
     def _combine_with_hook(self, combine_input: CombineInput) -> torch.Tensor:
         if self._pre_combine_hooks is not None:

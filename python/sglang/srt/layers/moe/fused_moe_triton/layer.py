@@ -1,8 +1,9 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import torch
 
@@ -36,7 +37,11 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     create_kt_config_from_server_args,
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
-from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.moe.token_dispatcher.base import (
+    BaseDispatcher,
+    MoeCombineChunk,
+    MoeDispatchChunk,
+)
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
@@ -74,6 +79,13 @@ _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+
+@dataclass
+class _MoePipelineState:
+    """Holds chunk-local results before they are finalized by the dispatcher."""
+
+    chunk_results: List[torch.Tensor]
 
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
@@ -996,37 +1008,73 @@ class FusedMoE(torch.nn.Module):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
-        dispatch_output = self.dispatcher.dispatch(
+        pipeline_state = _MoePipelineState(chunk_results=[])
+        for dispatch_chunk in self.iter_moe_dispatch_chunks(
             hidden_states=hidden_states, topk_output=topk_output
-        )
-        if _use_aiter and self.dispatcher.local_expert_mapping is not None:
-            self.expert_mask_gpu = (
-                (
-                    (self.dispatcher.local_expert_mapping >= 0)
-                    & (self.dispatcher.local_expert_mapping < self.num_local_experts)
+        ):
+            combine_chunk = self.run_moe_core_chunk(dispatch_chunk)
+            pipeline_state.chunk_results.append(
+                self.combine_moe_chunk(
+                    combine_chunk=combine_chunk,
+                    origin_hidden_states_dim=origin_hidden_states_dim,
                 )
-                .to(torch.int32)
-                .to(device="cuda")
             )
 
-        combine_input = self.run_moe_core(
-            dispatch_output=dispatch_output,
-        )
-
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
-
-            # TODO: should we add some conditions here?
-            final_hidden_states = final_hidden_states[
-                ..., :origin_hidden_states_dim
-            ].contiguous()
+        final_hidden_states = self.finalize_moe_pipeline(pipeline_state)
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
+
+    def iter_moe_dispatch_chunks(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+    ) -> Iterator[MoeDispatchChunk]:
+        for dispatch_chunk in self.dispatcher.iter_dispatch_chunks(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+        ):
+            if _use_aiter and self.dispatcher.local_expert_mapping is not None:
+                self.expert_mask_gpu = (
+                    (
+                        (self.dispatcher.local_expert_mapping >= 0)
+                        & (
+                            self.dispatcher.local_expert_mapping
+                            < self.num_local_experts
+                        )
+                    )
+                    .to(torch.int32)
+                    .to(device="cuda")
+                )
+            yield dispatch_chunk
+
+    def run_moe_core_chunk(self, dispatch_chunk: MoeDispatchChunk) -> MoeCombineChunk:
+        combine_input = self.run_moe_core(
+            dispatch_output=dispatch_chunk.dispatch_output,
+        )
+        return MoeCombineChunk(chunk=dispatch_chunk, combine_input=combine_input)
+
+    def combine_moe_chunk(
+        self,
+        combine_chunk: MoeCombineChunk,
+        origin_hidden_states_dim: int,
+    ) -> torch.Tensor:
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            hidden_states = self.dispatcher.combine_chunk(combine_chunk)
+
+            # TODO: should we add some conditions here?
+            hidden_states = hidden_states[..., :origin_hidden_states_dim].contiguous()
+        return hidden_states
+
+    def finalize_moe_pipeline(self, pipeline_state: _MoePipelineState) -> torch.Tensor:
+        assert pipeline_state.chunk_results, "MoE pipeline produced no chunk results"
+        if len(pipeline_state.chunk_results) != 1:
+            raise NotImplementedError(
+                "Chunked MoE result aggregation is not implemented yet"
+            )
+        return pipeline_state.chunk_results[0]
 
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
