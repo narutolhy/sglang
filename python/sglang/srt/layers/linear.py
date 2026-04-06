@@ -470,10 +470,10 @@ class ColumnParallelLinear(LinearBase):
                 input_,
                 [self.weight],
                 group_name,
+                layer=self,
+                bias=bias,
             )
             output = mm_outputs[0]
-            if bias is not None:
-                output = output + bias
             output_bias = self.bias if self.skip_bias_add else None
             return output, output_bias
 
@@ -1542,6 +1542,7 @@ class RowParallelLinear(LinearBase):
                 self.weight,
                 group_name,
                 bias=bias_,
+                layer=self,
             )
             output_bias = self.bias if self.skip_bias_add else None
             return output, output_bias
