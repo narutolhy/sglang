@@ -361,8 +361,29 @@ class LlamaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward with async TP: GEMM+ReduceScatter / AllGather+GEMM overlap."""
-        # Detect if hidden_states is already scattered from previous layer
         num_tokens = positions.shape[0]
+
+        # ReduceScatter requires M divisible by tp_size. Fall back if not.
+        if num_tokens % self.tp_size != 0:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual
+                )
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+            hidden_states = self.mlp(hidden_states)
+            return hidden_states, residual
+
+        # Detect if hidden_states is already scattered from previous layer
         is_scattered = hidden_states.shape[0] != num_tokens
 
         # Self Attention

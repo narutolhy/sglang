@@ -841,7 +841,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ):
-        if self.use_async_tp and not forward_batch.forward_mode.is_idle():
+        # Async TP only works when ALL layers are attention layers (pure dense model).
+        # In hybrid models (linear + attention), the communicator manages scatter state
+        # and forward_batch metadata, which conflicts with async TP's AG+GEMM approach.
+        if (
+            self.use_async_tp
+            and not forward_batch.forward_mode.is_idle()
+            and not hasattr(self.config, "layer_types")
+        ):
             return self._forward_async_tp(
                 positions, hidden_states, residual, forward_batch
             )

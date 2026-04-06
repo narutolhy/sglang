@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
@@ -24,6 +25,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInputFormat,
     DispatchOutput,
     DispatchOutputFormat,
+    MoeDispatchChunk,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
@@ -84,6 +86,7 @@ assert isinstance(StandardCombineInput, CombineInput)
 
 
 class StandardDispatcher(BaseDispatcher):
+    _PIPELINE_CHUNK_SIZE = max(1, int(os.getenv("SGLANG_MOE_PIPELINE_CHUNK_SIZE", "4096")))
 
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
@@ -101,6 +104,48 @@ class StandardDispatcher(BaseDispatcher):
         )
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.local_expert_mapping = None
+
+    @staticmethod
+    def _slice_standard_topk_output(
+        topk_output: StandardTopKOutput,
+        start: int,
+        end: int,
+    ) -> StandardTopKOutput:
+        router_logits = topk_output.router_logits
+        if router_logits is not None:
+            router_logits = router_logits[start:end]
+        return StandardTopKOutput(
+            topk_weights=topk_output.topk_weights[start:end],
+            topk_ids=topk_output.topk_ids[start:end],
+            router_logits=router_logits,
+        )
+
+    def iter_dispatch_chunks(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+    ):
+        if (
+            should_use_flashinfer_cutlass_moe_fp4_allgather()
+            or not TopKOutputChecker.format_is_standard(topk_output)
+            or hidden_states.shape[0] <= self._PIPELINE_CHUNK_SIZE
+        ):
+            yield from super().iter_dispatch_chunks(hidden_states, topk_output)
+            return
+
+        for chunk_id, start in enumerate(
+            range(0, hidden_states.shape[0], self._PIPELINE_CHUNK_SIZE)
+        ):
+            end = min(start + self._PIPELINE_CHUNK_SIZE, hidden_states.shape[0])
+            yield MoeDispatchChunk(
+                chunk_id=chunk_id,
+                dispatch_output=self.dispatch(
+                    hidden_states=hidden_states[start:end],
+                    topk_output=self._slice_standard_topk_output(
+                        topk_output=topk_output,
+                        start=start,
+                        end=end,
+                    ),
+                ),
+            )
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput

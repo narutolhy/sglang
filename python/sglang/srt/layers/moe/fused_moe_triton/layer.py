@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
+import os
 import logging
 from dataclasses import dataclass
 from enum import Enum
@@ -79,6 +80,9 @@ _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_enable_async_chunk_pipeline = bool(
+    int(os.getenv("SGLANG_ENABLE_MOE_ASYNC_CHUNK_PIPELINE", "0"))
+)
 
 
 @dataclass
@@ -86,6 +90,13 @@ class _MoePipelineState:
     """Holds chunk-local results before they are finalized by the dispatcher."""
 
     chunk_results: List[torch.Tensor]
+    ready_events: Optional[List[torch.cuda.Event]] = None
+
+
+@dataclass
+class _PendingMoeDispatchChunk:
+    chunk: MoeDispatchChunk
+    ready_event: torch.cuda.Event
 
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
@@ -1008,17 +1019,24 @@ class FusedMoE(torch.nn.Module):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
-        pipeline_state = _MoePipelineState(chunk_results=[])
-        for dispatch_chunk in self.iter_moe_dispatch_chunks(
-            hidden_states=hidden_states, topk_output=topk_output
-        ):
-            combine_chunk = self.run_moe_core_chunk(dispatch_chunk)
-            pipeline_state.chunk_results.append(
-                self.combine_moe_chunk(
-                    combine_chunk=combine_chunk,
-                    origin_hidden_states_dim=origin_hidden_states_dim,
-                )
+        if self.should_use_async_moe_chunk_pipeline(hidden_states):
+            pipeline_state = self.run_moe_pipeline_async(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+                origin_hidden_states_dim=origin_hidden_states_dim,
             )
+        else:
+            pipeline_state = _MoePipelineState(chunk_results=[])
+            for dispatch_chunk in self.iter_moe_dispatch_chunks(
+                hidden_states=hidden_states, topk_output=topk_output
+            ):
+                combine_chunk = self.run_moe_core_chunk(dispatch_chunk)
+                pipeline_state.chunk_results.append(
+                    self.combine_moe_chunk(
+                        combine_chunk=combine_chunk,
+                        origin_hidden_states_dim=origin_hidden_states_dim,
+                    )
+                )
 
         final_hidden_states = self.finalize_moe_pipeline(pipeline_state)
 
@@ -1026,6 +1044,70 @@ class FusedMoE(torch.nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
+
+    def should_use_async_moe_chunk_pipeline(self, hidden_states: torch.Tensor) -> bool:
+        return (
+            _enable_async_chunk_pipeline
+            and hidden_states.is_cuda
+            and hidden_states.shape[0] > 0
+        )
+
+    def run_moe_pipeline_async(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        origin_hidden_states_dim: int,
+    ) -> _MoePipelineState:
+        dispatch_stream = torch.cuda.Stream(device=hidden_states.device)
+        combine_stream = torch.cuda.Stream(device=hidden_states.device)
+        compute_stream = torch.cuda.current_stream(hidden_states.device)
+        dispatch_iter = iter(
+            self.iter_moe_dispatch_chunks(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
+        )
+        pipeline_state = _MoePipelineState(chunk_results=[], ready_events=[])
+
+        pending_dispatch = self._launch_next_dispatch_chunk(
+            dispatch_iter=dispatch_iter,
+            dispatch_stream=dispatch_stream,
+        )
+        while pending_dispatch is not None:
+            current_dispatch = pending_dispatch
+            pending_dispatch = self._launch_next_dispatch_chunk(
+                dispatch_iter=dispatch_iter,
+                dispatch_stream=dispatch_stream,
+            )
+
+            compute_stream.wait_event(current_dispatch.ready_event)
+            combine_chunk = self.run_moe_core_chunk(current_dispatch.chunk)
+            compute_done = compute_stream.record_event()
+
+            with torch.cuda.stream(combine_stream):
+                combine_stream.wait_event(compute_done)
+                hidden_states_chunk = self.combine_moe_chunk(
+                    combine_chunk=combine_chunk,
+                    origin_hidden_states_dim=origin_hidden_states_dim,
+                )
+            combine_done = combine_stream.record_event()
+            pipeline_state.chunk_results.append(hidden_states_chunk)
+            pipeline_state.ready_events.append(combine_done)
+
+        return pipeline_state
+
+    def _launch_next_dispatch_chunk(
+        self,
+        dispatch_iter: Iterator[MoeDispatchChunk],
+        dispatch_stream: torch.cuda.Stream,
+    ) -> Optional[_PendingMoeDispatchChunk]:
+        try:
+            with torch.cuda.stream(dispatch_stream):
+                chunk = next(dispatch_iter)
+            ready_event = dispatch_stream.record_event()
+            return _PendingMoeDispatchChunk(chunk=chunk, ready_event=ready_event)
+        except StopIteration:
+            return None
 
     def iter_moe_dispatch_chunks(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -1070,11 +1152,15 @@ class FusedMoE(torch.nn.Module):
 
     def finalize_moe_pipeline(self, pipeline_state: _MoePipelineState) -> torch.Tensor:
         assert pipeline_state.chunk_results, "MoE pipeline produced no chunk results"
-        if len(pipeline_state.chunk_results) != 1:
-            raise NotImplementedError(
-                "Chunked MoE result aggregation is not implemented yet"
+        if pipeline_state.ready_events:
+            current_stream = torch.cuda.current_stream(
+                pipeline_state.chunk_results[0].device
             )
-        return pipeline_state.chunk_results[0]
+            for ready_event in pipeline_state.ready_events:
+                current_stream.wait_event(ready_event)
+        if len(pipeline_state.chunk_results) == 1:
+            return pipeline_state.chunk_results[0]
+        return torch.cat(pipeline_state.chunk_results, dim=0)
 
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory

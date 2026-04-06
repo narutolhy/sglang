@@ -1,8 +1,8 @@
 """
 Async Tensor Parallelism: GEMM + ReduceScatter / AllGather + GEMM overlap.
 
-Uses torch.ops.symm_mem fused ops to overlap GEMM computation with TP
-communication. Instead of sequential GEMM → AllReduce, decomposes into:
+Uses torch.distributed._symmetric_memory fused ops to overlap GEMM computation
+with TP communication. Instead of sequential GEMM → AllReduce, decomposes into:
   - RowParallel: GEMM + ReduceScatter (fused, overlapped)
   - ColumnParallel: AllGather + GEMM (fused, overlapped)
 
@@ -24,29 +24,46 @@ import torch
 logger = logging.getLogger(__name__)
 
 _async_tp_available: Optional[bool] = None
+_fused_mrs = None  # fused_matmul_reduce_scatter
+_fused_agm = None  # fused_all_gather_matmul
+_restride_mrs = None  # restride_A_for_fused_matmul_reduce_scatter
+_restride_agm = None  # restride_A_shard_for_fused_all_gather_matmul
 
 
-def is_async_tp_available() -> bool:
-    """Check if torch.ops.symm_mem fused ops are available."""
-    global _async_tp_available
+def _init_fused_ops():
+    """Lazily import and cache the fused op references."""
+    global _fused_mrs, _fused_agm, _restride_mrs, _restride_agm, _async_tp_available
+
     if _async_tp_available is not None:
         return _async_tp_available
 
     try:
-        _async_tp_available = (
-            hasattr(torch.ops, "symm_mem")
-            and hasattr(torch.ops.symm_mem, "fused_matmul_reduce_scatter")
-            and hasattr(torch.ops.symm_mem, "fused_all_gather_matmul")
+        from torch.distributed._symmetric_memory import (
+            _fused_all_gather_matmul,
+            _fused_matmul_reduce_scatter,
+            restride_A_for_fused_matmul_reduce_scatter,
+            restride_A_shard_for_fused_all_gather_matmul,
         )
-    except Exception:
-        _async_tp_available = False
 
-    if not _async_tp_available:
+        _fused_mrs = _fused_matmul_reduce_scatter
+        _fused_agm = _fused_all_gather_matmul
+        _restride_mrs = restride_A_for_fused_matmul_reduce_scatter
+        _restride_agm = restride_A_shard_for_fused_all_gather_matmul
+        _async_tp_available = True
+        logger.info("Async TP fused ops loaded from torch.distributed._symmetric_memory")
+    except ImportError:
+        _async_tp_available = False
         logger.info(
-            "torch.ops.symm_mem fused ops not available. "
+            "torch.distributed._symmetric_memory fused ops not available. "
             "Async TP requires PyTorch >= 2.6 with CUDA."
         )
+
     return _async_tp_available
+
+
+def is_async_tp_available() -> bool:
+    """Check if fused GEMM+communication ops are available."""
+    return _init_fused_ops()
 
 
 def fused_matmul_reduce_scatter(
@@ -72,12 +89,16 @@ def fused_matmul_reduce_scatter(
     Returns:
         [M/tp, N] scattered reduced output
     """
-    # torch.ops.symm_mem.fused_matmul_reduce_scatter expects:
-    #   A @ B where A=[M,K], B=[K,N] -> matmul -> [M,N] -> reduce_scatter -> [M/tp, N]
-    # But weight is stored as [N, K] (transposed), so we pass weight.T
-    output = torch.ops.symm_mem.fused_matmul_reduce_scatter(
-        input,
-        weight.T,
+    _init_fused_ops()
+
+    # Restride input for optimal memory access pattern
+    A = _restride_mrs(input, scatter_dim)
+
+    # _fused_matmul_reduce_scatter(A, B, ...) computes ReduceScatter(A @ B)
+    # weight is [N, K], we need B=[K, N], so pass weight.T
+    output = _fused_mrs(
+        A,
+        weight.T.contiguous(),
         "sum",
         scatter_dim=scatter_dim,
         group_name=group_name,
@@ -110,14 +131,18 @@ def fused_all_gather_matmul(
         gathered_input: [M, K] or None
         matmul_results: list of [M, N_i] tensors
     """
-    # torch.ops.symm_mem.fused_all_gather_matmul expects B matrices as [K, N]
-    # but our weights are [N, K], so we transpose
-    Bs = [w.T for w in weights]
-    gathered, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
-        input_shard,
+    _init_fused_ops()
+
+    # Restride input shard for optimal memory access
+    A_shard = _restride_agm(input_shard, gather_dim)
+
+    # B matrices: weight is [N, K], need [K, N]
+    Bs = [w.T.contiguous() for w in weights]
+    gathered, mm_outputs = _fused_agm(
+        A_shard,
         Bs,
         gather_dim=gather_dim,
         group_name=group_name,
-        return_A=False,  # Don't need the gathered A tensor
+        return_A=False,
     )
     return gathered, mm_outputs
