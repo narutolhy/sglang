@@ -123,6 +123,22 @@ def _get_async_tp_chunk_size() -> int:
         return 1024
 
 
+def _get_async_tp_min_tokens(env_key: str) -> int:
+    value = os.getenv(env_key, "0")
+    try:
+        return max(int(value), 0)
+    except ValueError:
+        logger.warning("Invalid %s=%s; using 0", env_key, value)
+        return 0
+
+
+def get_async_tp_min_tokens(kind: str) -> int:
+    specific_env = f"SGLANG_ASYNC_TP_MIN_TOKENS_{kind.upper()}"
+    if specific_env in os.environ:
+        return _get_async_tp_min_tokens(specific_env)
+    return _get_async_tp_min_tokens("SGLANG_ASYNC_TP_MIN_TOKENS")
+
+
 def _get_async_tp_pipeline_stages() -> int:
     value = os.getenv("SGLANG_ASYNC_TP_PIPELINE_STAGES", "3")
     try:
@@ -132,6 +148,40 @@ def _get_async_tp_pipeline_stages() -> int:
             "Invalid SGLANG_ASYNC_TP_PIPELINE_STAGES=%s; using 3", value
         )
         return 3
+
+
+def get_async_tp_logical_num_tokens(tensor: torch.Tensor, tp_size: int) -> int:
+    return int(
+        getattr(
+            tensor,
+            ASYNC_TP_LOGICAL_TOKENS_ATTR,
+            tensor.shape[0] * tp_size
+            if getattr(tensor, ASYNC_TP_LAYOUT_ATTR, "full") == "scattered"
+            else tensor.shape[0],
+        )
+    )
+
+
+def should_use_async_tp_all_gather(
+    input: torch.Tensor, weight: torch.Tensor, tp_size: int
+) -> Tuple[bool, Optional[str]]:
+    reason = get_async_tp_matmul_unavailable_reason(input, weight)
+    logical_num_tokens = get_async_tp_logical_num_tokens(input, tp_size)
+    min_tokens = get_async_tp_min_tokens("ag")
+    if reason is None and logical_num_tokens < min_tokens:
+        reason = f"logical_num_tokens={logical_num_tokens}<min_tokens={min_tokens}"
+    return reason is None, reason
+
+
+def should_use_async_tp_reduce_scatter(
+    input: torch.Tensor, weight: torch.Tensor, tp_size: int
+) -> Tuple[bool, Optional[str]]:
+    reason = get_async_tp_matmul_unavailable_reason(input, weight)
+    logical_num_tokens = get_async_tp_logical_num_tokens(input, tp_size)
+    min_tokens = get_async_tp_min_tokens("rs")
+    if reason is None and logical_num_tokens < min_tokens:
+        reason = f"logical_num_tokens={logical_num_tokens}<min_tokens={min_tokens}"
+    return reason is None, reason
 
 
 def _should_log_decisions() -> bool:
@@ -342,7 +392,7 @@ def _chunked_all_gather_matmul_nccl(
     ]
     gather_ready = [torch.cuda.Event() for _ in range(pipeline_stages)]
     compute_done = [None] * pipeline_stages
-    outputs: List[torch.Tensor] = []
+    output_holder: List[Optional[torch.Tensor]] = [None]
 
     def launch_gather(chunk_idx: int, buf_idx: int):
         start = chunk_idx * local_chunk_rows
@@ -368,7 +418,12 @@ def _chunked_all_gather_matmul_nccl(
         rows = min(local_chunk_rows, total_local_rows - start)
         gathered_rows = rows * tp_size
         gathered = gather_buffers[curr_idx][:gathered_rows]
-        outputs.append(_run_gemm(layer, gathered, bias))
+        output_chunk = _run_gemm(layer, gathered, bias)
+        if output_holder[0] is None:
+            output_holder[0] = output_chunk.new_empty(
+                total_rows, output_chunk.shape[1]
+            )
+        output_holder[0].narrow(0, start * tp_size, gathered_rows).copy_(output_chunk)
         compute_done[curr_idx] = torch.cuda.Event()
         compute_done[curr_idx].record(current_stream)
 
@@ -377,7 +432,8 @@ def _chunked_all_gather_matmul_nccl(
             launch_gather(next_chunk_idx, curr_idx)
 
     current_stream.wait_stream(comm_stream)
-    return torch.cat(outputs, dim=0)
+    assert output_holder[0] is not None
+    return output_holder[0]
 
 
 def _chunked_matmul_reduce_scatter_nccl(
@@ -413,7 +469,7 @@ def _chunked_matmul_reduce_scatter_nccl(
     partial_chunks: List[Optional[torch.Tensor]] = [None] * pipeline_stages
     compute_ready = [None] * pipeline_stages
     rs_done = [None] * pipeline_stages
-    outputs: List[torch.Tensor] = [None] * num_chunks  # type: ignore[assignment]
+    output = input.new_empty(local_rows, layer.output_size)
 
     def launch_compute(chunk_idx: int, buf_idx: int):
         start = chunk_idx * chunk_rows
@@ -433,7 +489,7 @@ def _chunked_matmul_reduce_scatter_nccl(
         if rows <= 0:
             return
         output_rows = rows // tp_size
-        out_chunk = input.new_empty(output_rows, layer.output_size)
+        out_chunk = output.narrow(0, start // tp_size, output_rows)
         ready_event = compute_ready[buf_idx]
         assert ready_event is not None
         partial = partial_chunks[buf_idx]
@@ -445,7 +501,6 @@ def _chunked_matmul_reduce_scatter_nccl(
                 out_chunk.add_(bias)
             rs_done[buf_idx] = torch.cuda.Event()
             rs_done[buf_idx].record(comm_stream)
-        outputs[chunk_idx] = out_chunk
 
     for chunk_idx in range(min(num_chunks, pipeline_stages)):
         launch_compute(chunk_idx, chunk_idx)
@@ -458,7 +513,7 @@ def _chunked_matmul_reduce_scatter_nccl(
             launch_compute(next_chunk_idx, curr_idx)
 
     current_stream.wait_stream(comm_stream)
-    return torch.cat(outputs, dim=0)
+    return output
 
 
 def fused_matmul_reduce_scatter(
