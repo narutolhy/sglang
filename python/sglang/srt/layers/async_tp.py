@@ -304,11 +304,25 @@ def can_run_async_tp_matmul(input: torch.Tensor, weight: torch.Tensor) -> bool:
     return get_async_tp_matmul_unavailable_reason(input, weight) is None
 
 
+_weight_t_cache: Dict[int, torch.Tensor] = {}
+
+
 def _get_transposed_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Return contiguous transposed weight. No caching to avoid doubling
-    GPU memory for large models (e.g. 70B TP=4 needs ~33GB extra)."""
-    weight_t = weight.T.contiguous()
-    return weight_t
+    """Return cached contiguous transposed weight.
+
+    Caches weight.T.contiguous() keyed by tensor data_ptr to avoid
+    re-transposing on every forward pass. This doubles weight memory
+    (~33GB extra for 70B TP=4) but eliminates the per-call transpose
+    overhead that was causing 12-18% regression in fused SP.
+
+    Use --mem-fraction-static 0.5 to reduce KV cache and leave room.
+    """
+    key = weight.data_ptr()
+    cached = _weight_t_cache.get(key)
+    if cached is None:
+        cached = weight.T.contiguous()
+        _weight_t_cache[key] = cached
+    return cached
 
 
 def _run_gemm(layer, input_chunk: torch.Tensor, bias: Optional[torch.Tensor]):
@@ -601,7 +615,7 @@ def _ensure_fused_ops_registered():
         if pad_size > 0:
             input = torch.nn.functional.pad(input, (0, 0, 0, pad_size))
         A = _restride_mrs(input, 0)
-        weight_t = weight.T.contiguous()
+        weight_t = _get_transposed_weight(weight)
         output = _fused_mrs(
             A, weight_t, "sum", scatter_dim=0, group_name=group_name
         )
@@ -619,7 +633,7 @@ def _ensure_fused_ops_registered():
         input_shard: torch.Tensor, weight: torch.Tensor, group_name: str
     ) -> torch.Tensor:
         A_shard = _restride_agm(input_shard, 0)
-        weight_t = weight.T.contiguous()
+        weight_t = _get_transposed_weight(weight)
         _, mm_outputs = _fused_agm(
             A_shard,
             [weight_t],
