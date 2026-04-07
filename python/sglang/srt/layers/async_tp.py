@@ -656,10 +656,14 @@ def _fake_fused_ag_gemm(
 
 
 def is_fused_gemm_rs_available() -> bool:
+    if os.environ.get("SGLANG_ASYNC_TP_USE_FUSED", "1") == "0":
+        return False
     return _ensure_fused_ops_registered()
 
 
 def is_fused_ag_gemm_available() -> bool:
+    if os.environ.get("SGLANG_ASYNC_TP_USE_FUSED", "1") == "0":
+        return False
     return _ensure_fused_ops_registered()
 
 
