@@ -154,6 +154,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
+        # Async TP: weight may be pre-transposed to [K, N] layout.
+        # F.linear expects [N, K], so use matmul directly instead.
+        if getattr(layer, "_async_tp_weight_transposed", False):
+            output = x @ layer.weight
+            if bias is not None:
+                output = output + bias
+            return output
+
         return F.linear(x, layer.weight, bias)
 
 

@@ -1170,6 +1170,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
 
+        # Pre-transpose weights for async TP fused ops (zero extra memory)
+        if self.server_args.enable_async_tp and self.tp_size > 1:
+            from sglang.srt.layers.async_tp import (
+                pretranspose_linear_weights_for_async_tp,
+            )
+
+            pretranspose_linear_weights_for_async_tp(self.model)
+
         # Publish metadata to ModelExpress if running as seed source
         if self.server_args.modelexpress_source:
             # Seed loads via DefaultModelLoader (load_format=auto), which doesn't
