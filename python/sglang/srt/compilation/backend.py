@@ -419,6 +419,18 @@ class SGLangBackend:
         self.graph = graph
         self.configure_post_pass()
 
+        # Pre-split pass: replace AllReduce (split_op) with RS+AG (custom_ops)
+        # to eliminate graph split points when async TP is enabled.
+        from sglang.srt.compilation.async_tp_pass import (
+            async_tp_pass,
+            ensure_ops_registered,
+            is_async_tp_pass_enabled,
+        )
+
+        if is_async_tp_pass_enabled():
+            ensure_ops_registered()
+            async_tp_pass(graph)
+
         self.split_gm, self.piecewise_graphs = split_graph(
             graph,
             self.compile_config.split_ops,
