@@ -13,6 +13,7 @@ top of standard collectives.
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -22,6 +23,11 @@ from sglang.srt.distributed import get_tp_group
 
 logger = logging.getLogger(__name__)
 
+ASYNC_TP_LAYOUT_ATTR = "_async_tp_layout"
+ASYNC_TP_LOGICAL_TOKENS_ATTR = "_async_tp_logical_num_tokens"
+ASYNC_TP_PADDED_TOKENS_ATTR = "_async_tp_padded_num_tokens"
+ASYNC_TP_TP_SIZE_ATTR = "_async_tp_tp_size"
+
 _async_tp_available: Optional[bool] = None
 _fused_mrs = None  # fused_matmul_reduce_scatter
 _fused_agm = None  # fused_all_gather_matmul
@@ -29,6 +35,79 @@ _restride_mrs = None  # restride_A_for_fused_matmul_reduce_scatter
 _restride_agm = None  # restride_A_shard_for_fused_all_gather_matmul
 _tp_world_sizes: Dict[str, int] = {}
 _comm_streams: Dict[int, torch.cuda.Stream] = {}
+_decision_log_keys: set[str] = set()
+
+
+@dataclass
+class AsyncTpTensor:
+    tensor: torch.Tensor
+    layout: str
+    logical_num_tokens: int
+    padded_num_tokens: int
+    tp_size: int
+
+    @property
+    def shard_num_tokens(self) -> int:
+        return self.tensor.shape[0]
+
+    def is_scattered(self) -> bool:
+        return self.layout == "scattered"
+
+    def with_tensor(self, tensor: torch.Tensor) -> "AsyncTpTensor":
+        return AsyncTpTensor(
+            tensor=tensor,
+            layout=self.layout,
+            logical_num_tokens=self.logical_num_tokens,
+            padded_num_tokens=self.padded_num_tokens,
+            tp_size=self.tp_size,
+        )
+
+    def mark_scattered(
+        self, tensor: torch.Tensor, padded_num_tokens: Optional[int] = None
+    ) -> "AsyncTpTensor":
+        return AsyncTpTensor(
+            tensor=tensor,
+            layout="scattered",
+            logical_num_tokens=self.logical_num_tokens,
+            padded_num_tokens=(
+                padded_num_tokens
+                if padded_num_tokens is not None
+                else tensor.shape[0] * self.tp_size
+            ),
+            tp_size=self.tp_size,
+        )
+
+    def attach(self) -> torch.Tensor:
+        setattr(self.tensor, ASYNC_TP_LAYOUT_ATTR, self.layout)
+        setattr(
+            self.tensor, ASYNC_TP_LOGICAL_TOKENS_ATTR, self.logical_num_tokens
+        )
+        setattr(self.tensor, ASYNC_TP_PADDED_TOKENS_ATTR, self.padded_num_tokens)
+        setattr(self.tensor, ASYNC_TP_TP_SIZE_ATTR, self.tp_size)
+        return self.tensor
+
+    @classmethod
+    def from_tensor(
+        cls, tensor: torch.Tensor, logical_num_tokens: int, tp_size: int
+    ) -> "AsyncTpTensor":
+        layout = getattr(
+            tensor,
+            ASYNC_TP_LAYOUT_ATTR,
+            "scattered" if tensor.shape[0] != logical_num_tokens else "full",
+        )
+        return cls(
+            tensor=tensor,
+            layout=layout,
+            logical_num_tokens=getattr(
+                tensor, ASYNC_TP_LOGICAL_TOKENS_ATTR, logical_num_tokens
+            ),
+            padded_num_tokens=getattr(
+                tensor,
+                ASYNC_TP_PADDED_TOKENS_ATTR,
+                tensor.shape[0] * tp_size if layout == "scattered" else tensor.shape[0],
+            ),
+            tp_size=getattr(tensor, ASYNC_TP_TP_SIZE_ATTR, tp_size),
+        )
 
 
 def _get_async_tp_backend() -> str:
@@ -42,6 +121,46 @@ def _get_async_tp_chunk_size() -> int:
     except ValueError:
         logger.warning("Invalid SGLANG_ASYNC_TP_CHUNK_SIZE=%s; using 1024", value)
         return 1024
+
+
+def _get_async_tp_pipeline_stages() -> int:
+    value = os.getenv("SGLANG_ASYNC_TP_PIPELINE_STAGES", "3")
+    try:
+        return max(int(value), 2)
+    except ValueError:
+        logger.warning(
+            "Invalid SGLANG_ASYNC_TP_PIPELINE_STAGES=%s; using 3", value
+        )
+        return 3
+
+
+def _should_log_decisions() -> bool:
+    value = os.getenv("SGLANG_ASYNC_TP_LOG_DECISIONS", "")
+    return value.lower() in ("1", "true", "yes", "y")
+
+
+def log_async_tp_decision_once(key: str, message: str) -> None:
+    if not _should_log_decisions() or key in _decision_log_keys:
+        return
+    _decision_log_keys.add(key)
+    logger.info("[async_tp] %s", message)
+    # Also print to ensure visibility in all process configurations
+    import sys
+    print(f"[async_tp] {message}", file=sys.stderr, flush=True)
+
+
+def log_async_tp_backend_once() -> None:
+    backend = _get_async_tp_backend()
+    if backend == "nccl":
+        log_async_tp_decision_once(
+            f"backend:{backend}:{_get_async_tp_chunk_size()}:{_get_async_tp_pipeline_stages()}",
+            f"using backend={backend} chunk_size={_get_async_tp_chunk_size()} pipeline_stages={_get_async_tp_pipeline_stages()}",
+        )
+    else:
+        log_async_tp_decision_once(
+            f"backend:{backend}",
+            f"using backend={backend}",
+        )
 
 
 def _get_comm_stream(device: torch.device) -> torch.cuda.Stream:
@@ -101,32 +220,44 @@ def _get_tp_world_size(group_name: str) -> int:
 
 def is_async_tp_available() -> bool:
     """Check if the selected backend is available."""
+    log_async_tp_backend_once()
     if _get_async_tp_backend() == "nccl":
         tp_group = get_tp_group()
         return tp_group.world_size > 1 and tp_group.pynccl_comm is not None
     return _init_fused_ops()
 
 
-def _get_transposed_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Cache the contiguous transposed view for static inference weights."""
-    version = getattr(weight, "_version", None)
-    cache_key = (
-        weight.data_ptr(),
-        tuple(weight.shape),
-        tuple(weight.stride()),
-        version,
-    )
-    cached = getattr(weight, "_sglang_async_tp_weight_t_cache", None)
-    if cached is not None:
-        cached_key, cached_weight_t = cached
-        if cached_key == cache_key:
-            return cached_weight_t
+def get_async_tp_matmul_unavailable_reason(
+    input: torch.Tensor, weight: torch.Tensor
+) -> Optional[str]:
+    backend = _get_async_tp_backend()
+    if backend == "nccl":
+        tp_group = get_tp_group()
+        if tp_group.world_size <= 1:
+            return "tp_world_size<=1"
+        if tp_group.pynccl_comm is None:
+            return "missing_pynccl_comm"
+        if not input.is_cuda or not weight.is_cuda:
+            return "non_cuda_tensor"
+        return None
 
+    if not _init_fused_ops():
+        return "missing_symm_mem_fused_ops"
+    if not input.is_cuda or not weight.is_cuda:
+        return "non_cuda_tensor"
+    if input.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        return f"unsupported_dtype(input={input.dtype},weight={weight.dtype})"
+    return None
+
+
+def can_run_async_tp_matmul(input: torch.Tensor, weight: torch.Tensor) -> bool:
+    return get_async_tp_matmul_unavailable_reason(input, weight) is None
+
+
+def _get_transposed_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Return contiguous transposed weight. No caching to avoid doubling
+    GPU memory for large models (e.g. 70B TP=4 needs ~33GB extra)."""
     weight_t = weight.T.contiguous()
-    try:
-        weight._sglang_async_tp_weight_t_cache = (cache_key, weight_t)
-    except (AttributeError, RuntimeError):
-        pass
     return weight_t
 
 
@@ -203,15 +334,15 @@ def _chunked_all_gather_matmul_nccl(
 
     comm_stream = _get_comm_stream(input_shard.device)
     current_stream = torch.cuda.current_stream(input_shard.device)
+    pipeline_stages = min(_get_async_tp_pipeline_stages(), num_chunks if (num_chunks := (total_local_rows + local_chunk_rows - 1) // local_chunk_rows) > 0 else 1)
 
     gather_buffers = [
         input_shard.new_empty(local_chunk_rows * tp_size, input_shard.shape[1])
-        for _ in range(2)
+        for _ in range(pipeline_stages)
     ]
-    gather_ready = [torch.cuda.Event() for _ in range(2)]
-    compute_done = [None, None]
+    gather_ready = [torch.cuda.Event() for _ in range(pipeline_stages)]
+    compute_done = [None] * pipeline_stages
     outputs: List[torch.Tensor] = []
-    num_chunks = (total_local_rows + local_chunk_rows - 1) // local_chunk_rows
 
     def launch_gather(chunk_idx: int, buf_idx: int):
         start = chunk_idx * local_chunk_rows
@@ -226,10 +357,11 @@ def _chunked_all_gather_matmul_nccl(
             tp_group.all_gather_into_tensor(gather_buf, local_chunk)
             gather_ready[buf_idx].record(comm_stream)
 
-    launch_gather(0, 0)
+    for chunk_idx in range(min(num_chunks, pipeline_stages)):
+        launch_gather(chunk_idx, chunk_idx)
+
     for chunk_idx in range(num_chunks):
-        curr_idx = chunk_idx % 2
-        next_idx = (chunk_idx + 1) % 2
+        curr_idx = chunk_idx % pipeline_stages
         current_stream.wait_event(gather_ready[curr_idx])
 
         start = chunk_idx * local_chunk_rows
@@ -240,8 +372,9 @@ def _chunked_all_gather_matmul_nccl(
         compute_done[curr_idx] = torch.cuda.Event()
         compute_done[curr_idx].record(current_stream)
 
-        if chunk_idx + 1 < num_chunks:
-            launch_gather(chunk_idx + 1, next_idx)
+        next_chunk_idx = chunk_idx + pipeline_stages
+        if next_chunk_idx < num_chunks:
+            launch_gather(next_chunk_idx, curr_idx)
 
     current_stream.wait_stream(comm_stream)
     return torch.cat(outputs, dim=0)
@@ -276,9 +409,10 @@ def _chunked_matmul_reduce_scatter_nccl(
     comm_stream = _get_comm_stream(input.device)
     current_stream = torch.cuda.current_stream(input.device)
     num_chunks = (total_rows + chunk_rows - 1) // chunk_rows
-    partial_chunks: List[Optional[torch.Tensor]] = [None, None]
-    compute_ready = [None, None]
-    rs_done = [None, None]
+    pipeline_stages = min(_get_async_tp_pipeline_stages(), num_chunks if num_chunks > 0 else 1)
+    partial_chunks: List[Optional[torch.Tensor]] = [None] * pipeline_stages
+    compute_ready = [None] * pipeline_stages
+    rs_done = [None] * pipeline_stages
     outputs: List[torch.Tensor] = [None] * num_chunks  # type: ignore[assignment]
 
     def launch_compute(chunk_idx: int, buf_idx: int):
@@ -313,13 +447,15 @@ def _chunked_matmul_reduce_scatter_nccl(
             rs_done[buf_idx].record(comm_stream)
         outputs[chunk_idx] = out_chunk
 
-    launch_compute(0, 0)
+    for chunk_idx in range(min(num_chunks, pipeline_stages)):
+        launch_compute(chunk_idx, chunk_idx)
+
     for chunk_idx in range(num_chunks):
-        curr_idx = chunk_idx % 2
-        next_idx = (chunk_idx + 1) % 2
+        curr_idx = chunk_idx % pipeline_stages
         launch_reduce_scatter(chunk_idx, curr_idx)
-        if chunk_idx + 1 < num_chunks:
-            launch_compute(chunk_idx + 1, next_idx)
+        next_chunk_idx = chunk_idx + pipeline_stages
+        if next_chunk_idx < num_chunks:
+            launch_compute(next_chunk_idx, curr_idx)
 
     current_stream.wait_stream(comm_stream)
     return torch.cat(outputs, dim=0)
