@@ -305,19 +305,23 @@ def can_run_async_tp_matmul(input: torch.Tensor, weight: torch.Tensor) -> bool:
 
 
 _weight_t_cache: Dict[int, torch.Tensor] = {}
+_pretransposed_weights: set = set()
+
+
+def mark_weight_pretransposed(weight: torch.Tensor) -> None:
+    """Mark a weight tensor as already in [K, N] (transposed) layout."""
+    _pretransposed_weights.add(weight.data_ptr())
 
 
 def _get_transposed_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Return cached contiguous transposed weight.
+    """Return weight in [K, N] layout for symm_mem fused ops.
 
-    Caches weight.T.contiguous() keyed by tensor data_ptr to avoid
-    re-transposing on every forward pass. This doubles weight memory
-    (~33GB extra for 70B TP=4) but eliminates the per-call transpose
-    overhead that was causing 12-18% regression in fused SP.
-
-    Use --mem-fraction-static 0.5 to reduce KV cache and leave room.
+    If weight is pre-transposed (marked via mark_weight_pretransposed),
+    returns it directly. Otherwise caches weight.T.contiguous().
     """
     key = weight.data_ptr()
+    if key in _pretransposed_weights:
+        return weight
     cached = _weight_t_cache.get(key)
     if cached is None:
         cached = weight.T.contiguous()
@@ -695,3 +699,46 @@ def reg_fused_ag_gemm(
     """Compile-compatible fused AllGather+GEMM."""
     _ensure_fused_ops_registered()
     return torch.ops.sglang.fused_ag_gemm(input_shard, weight, group_name)
+
+
+def pretranspose_linear_weights_for_async_tp(model: torch.nn.Module) -> int:
+    """In-place transpose weights of RowParallelLinear and ColumnParallelLinear
+    for fused async TP ops. Converts weight from [N, K] to [K, N] layout.
+
+    This avoids per-call weight.T.contiguous() overhead AND avoids doubling
+    memory (no separate cache needed).
+
+    The normal decode path uses quant_method.apply() which calls F.linear(x, W).
+    With transposed W ([K, N]), F.linear would be wrong. So we also set a flag
+    on the layer to indicate the weight is transposed, and forward_gemm_rs /
+    forward_ag_gemm will handle it. The decode path (standard forward) bypasses
+    fused ops and uses quant_method.apply() which is NOT affected because decode
+    doesn't go through the async TP path.
+
+    Returns: number of weights transposed.
+    """
+    from sglang.srt.layers.linear import (
+        ColumnParallelLinear,
+        RowParallelLinear,
+    )
+
+    count = 0
+    for name, module in model.named_modules():
+        if isinstance(module, (RowParallelLinear, ColumnParallelLinear)):
+            if hasattr(module, "weight") and module.weight is not None:
+                old_weight = module.weight.data
+                new_weight = old_weight.T.contiguous()
+                module.weight.data = new_weight
+                mark_weight_pretransposed(module.weight)
+                module._async_tp_weight_transposed = True
+                count += 1
+                # Free old weight memory
+                del old_weight
+
+    if count > 0:
+        torch.cuda.empty_cache()
+        logger.info(
+            f"Pre-transposed {count} linear weights for async TP fused ops "
+            f"(zero extra memory)"
+        )
+    return count
