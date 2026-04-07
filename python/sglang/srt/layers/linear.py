@@ -462,26 +462,68 @@ class ColumnParallelLinear(LinearBase):
             and hasattr(self, "weight")
             and self.tp_size > 1
         ):
-            from sglang.srt.layers.async_tp import fused_all_gather_matmul
-
-            tp_group = get_tp_group()
-            group_name = tp_group.device_group.group_name
-            _, mm_outputs = fused_all_gather_matmul(
-                input_,
-                [self.weight],
-                group_name,
-                layer=self,
-                bias=bias,
+            from sglang.srt.layers.async_tp import (
+                can_run_async_tp_matmul,
+                fused_all_gather_matmul,
+                log_async_tp_decision_once,
+                should_use_async_tp_all_gather,
             )
-            output = mm_outputs[0]
-            output_bias = self.bias if self.skip_bias_add else None
-            return output, output_bias
+
+            should_use_fused_all_gather, reason = should_use_async_tp_all_gather(
+                input_, self.weight, self.tp_size
+            )
+            if not should_use_fused_all_gather:
+                log_async_tp_decision_once(
+                    f"ag_fallback:{self.prefix}:{reason}",
+                    f"{self.prefix or '<unnamed>'}: fallback to standard all-gather matmul because {reason}",
+                )
+                use_fused_all_gather = False
+            else:
+                assert can_run_async_tp_matmul(input_, self.weight)
+
+                tp_group = get_tp_group()
+                group_name = tp_group.device_group.group_name
+                _, mm_outputs = fused_all_gather_matmul(
+                    input_,
+                    [self.weight],
+                    group_name,
+                    layer=self,
+                    bias=bias,
+                )
+                output = mm_outputs[0]
+                output_bias = self.bias if self.skip_bias_add else None
+                return output, output_bias
 
         # Matrix multiply.
         assert self.quant_method is not None
         output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output:
             # All-gather across the partitions.
+            output = tensor_model_parallel_all_gather(output_parallel)
+        else:
+            output = output_parallel
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
+    def forward_ag_gemm(self, input_shard: torch.Tensor):
+        """AllGather + GEMM: compile-compatible sequence parallelism.
+
+        AllGathers scattered input [M/tp, K] back to [M, K], then does GEMM.
+        Uses reg_all_gather_into_tensor (custom_op, NOT split_op) so it
+        stays inside compiled graphs / CUDA graph capture.
+
+        Returns: (output, output_bias) where output is [M, N/tp].
+        """
+        tp_group = get_tp_group()
+        gathered = input_shard.new_empty(
+            input_shard.shape[0] * self.tp_size, input_shard.shape[1]
+        )
+        tp_group.all_gather_into_tensor(gathered, input_shard)
+
+        # Standard GEMM on gathered input
+        bias = self.bias if not self.skip_bias_add else None
+        output_parallel = self.quant_method.apply(self, gathered, bias)
+        if self.gather_output:
             output = tensor_model_parallel_all_gather(output_parallel)
         else:
             output = output_parallel
@@ -1533,19 +1575,38 @@ class RowParallelLinear(LinearBase):
             and self.tp_size > 1
             and hasattr(self, "weight")
         ):
-            from sglang.srt.layers.async_tp import fused_matmul_reduce_scatter
-
-            tp_group = get_tp_group()
-            group_name = tp_group.device_group.group_name
-            output = fused_matmul_reduce_scatter(
-                input_parallel,
-                self.weight,
-                group_name,
-                bias=bias_,
-                layer=self,
+            from sglang.srt.layers.async_tp import (
+                can_run_async_tp_matmul,
+                fused_matmul_reduce_scatter,
+                log_async_tp_decision_once,
+                should_use_async_tp_reduce_scatter,
             )
-            output_bias = self.bias if self.skip_bias_add else None
-            return output, output_bias
+
+            should_use_fused_reduce_scatter, reason = (
+                should_use_async_tp_reduce_scatter(
+                    input_parallel, self.weight, self.tp_size
+                )
+            )
+            if not should_use_fused_reduce_scatter:
+                log_async_tp_decision_once(
+                    f"rs_fallback:{self.prefix}:{reason}",
+                    f"{self.prefix or '<unnamed>'}: fallback to standard reduce-scatter/all-reduce because {reason}",
+                )
+                use_fused_reduce_scatter = False
+            else:
+                assert can_run_async_tp_matmul(input_parallel, self.weight)
+
+                tp_group = get_tp_group()
+                group_name = tp_group.device_group.group_name
+                output = fused_matmul_reduce_scatter(
+                    input_parallel,
+                    self.weight,
+                    group_name,
+                    bias=bias_,
+                    layer=self,
+                )
+                output_bias = self.bias if self.skip_bias_add else None
+                return output, output_bias
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1563,6 +1624,34 @@ class RowParallelLinear(LinearBase):
         output_bias = self.bias if self.skip_bias_add else None
 
         return output, output_bias
+
+    def forward_gemm_rs(self, input_: torch.Tensor) -> torch.Tensor:
+        """GEMM + ReduceScatter: compile-compatible sequence parallelism.
+
+        Does GEMM without AllReduce, then ReduceScatter the result.
+        Uses reg_reduce_scatter_tensor (custom_op, NOT split_op) so it
+        stays inside compiled graphs / CUDA graph capture.
+
+        Returns: [M/tp, N] scattered output.
+        """
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            splitted_input = split_tensor_along_last_dim(
+                input_, num_partitions=self.tp_size
+            )
+            input_parallel = splitted_input[self.tp_rank].contiguous()
+
+        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+
+        # ReduceScatter instead of AllReduce
+        tp_group = get_tp_group()
+        local_rows = output_parallel.shape[0] // self.tp_size
+        output_rs = output_parallel.new_empty(local_rows, output_parallel.shape[1])
+        tp_group.reduce_scatter_tensor(output_rs, output_parallel)
+
+        return output_rs
 
     def extra_repr(self) -> str:
         s = f"input_features={self.input_size_per_partition}"

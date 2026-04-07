@@ -30,7 +30,12 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.layers.activation import SiluAndMul
-
+from sglang.srt.layers.async_tp import (
+    AsyncTpTensor,
+    get_async_tp_min_tokens,
+    log_async_tp_decision_once,
+    should_use_async_tp_reduce_scatter,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -115,11 +120,18 @@ class LlamaMLP(nn.Module):
             x, use_fused_all_gather=(use_async_tp and is_scattered)
         )
         x = self.act_fn(gate_up)
+        used_async_rs = False
         if use_async_tp:
+            used_async_rs, _ = should_use_async_tp_reduce_scatter(
+                x,
+                self.down_proj.weight,
+                self.down_proj.tp_size,
+            )
+        if used_async_rs:
             x, _ = self.down_proj(x, use_fused_reduce_scatter=True)
         else:
             x, _ = self.down_proj(x, skip_all_reduce=use_reduce_scatter)
-        return x
+        return x, used_async_rs
 
 
 class LlamaAttention(nn.Module):
@@ -259,7 +271,14 @@ class LlamaAttention(nn.Module):
             )
 
         attn_output = self.attn(q, k, v, forward_batch)
+        used_async_rs = False
         if use_async_tp:
+            used_async_rs, _ = should_use_async_tp_reduce_scatter(
+                attn_output,
+                self.o_proj.weight,
+                self.o_proj.tp_size,
+            )
+        if used_async_rs:
             # Pad attn_output to nearest multiple of tp_size for GEMM+RS
             tp_size = get_tensor_model_parallel_world_size()
             pad_size = (tp_size - attn_output.shape[0] % tp_size) % tp_size
@@ -270,7 +289,7 @@ class LlamaAttention(nn.Module):
             output, _ = self.o_proj(attn_output, use_fused_reduce_scatter=True)
         else:
             output, _ = self.o_proj(attn_output)
-        return output
+        return output, used_async_rs
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -337,6 +356,12 @@ class LlamaDecoderLayer(nn.Module):
             and server_args.enable_async_tp
             and self.tp_size > 1
         )
+        # Compile-compatible SP mode: uses plain RS/AG custom_ops
+        # instead of fused symm_mem ops that break torch.compile
+        self.use_compile_sp = (
+            self.use_async_tp
+            and not getattr(server_args, "disable_piecewise_cuda_graph", True)
+        )
 
     def forward(
         self,
@@ -345,6 +370,10 @@ class LlamaDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.use_compile_sp:
+            return self._forward_compile_sp(
+                positions, hidden_states, forward_batch, residual
+            )
         if self.use_async_tp:
             return self._forward_async_tp(
                 positions, hidden_states, forward_batch, residual
@@ -356,7 +385,7 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
+        hidden_states, _ = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
@@ -364,7 +393,104 @@ class LlamaDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, _ = self.mlp(hidden_states)
+        return hidden_states, residual
+
+    def _forward_compile_sp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compile-compatible sequence parallelism.
+
+        Uses plain RS/AG (registered custom_ops, NOT split_ops) so the
+        entire layer stays inside one compiled subgraph / CUDA graph.
+        No fused symm_mem ops, no Python stream management.
+
+        Decode falls back to standard path (no SP for M=1).
+        """
+        num_tokens = positions.shape[0]
+
+        # Decode: use standard path (no SP benefit for tiny GEMM)
+        if num_tokens == 0 or forward_batch.forward_mode.is_decode():
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual
+                )
+            hidden_states, _ = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+            hidden_states, _ = self.mlp(hidden_states)
+            return hidden_states, residual
+
+        # Detect scattered state from previous layer
+        is_scattered = getattr(
+            hidden_states, "_async_tp_scattered", False
+        ) or hidden_states.shape[0] != num_tokens
+
+        # LayerNorm + residual
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        # --- Self Attention ---
+        # qkv_proj: AG + GEMM if scattered
+        if is_scattered:
+            qkv, _ = self.self_attn.qkv_proj.forward_ag_gemm(hidden_states)
+            # AG gathers to padded_m; truncate to M for attention
+            if qkv.shape[0] > num_tokens:
+                qkv = qkv[:num_tokens]
+            q, k, v = qkv.split(
+                [self.self_attn.q_size, self.self_attn.kv_size, self.self_attn.kv_size],
+                dim=-1,
+            )
+            q, k = self.self_attn.rotary_emb(positions, q, k)
+        else:
+            q, k, v = self.self_attn.forward_prepare_native(positions, hidden_states)
+
+        attn_output = self.self_attn.attn(q, k, v, forward_batch)
+
+        # o_proj: GEMM + RS
+        # Pad to nearest multiple of tp_size for RS
+        tp_size = self.tp_size
+        pad_size = (tp_size - attn_output.shape[0] % tp_size) % tp_size
+        if pad_size > 0:
+            attn_output = torch.nn.functional.pad(attn_output, (0, 0, 0, pad_size))
+        hidden_states = self.self_attn.o_proj.forward_gemm_rs(attn_output)
+
+        # Scatter residual to match
+        if not is_scattered:
+            tp_rank = get_tensor_model_parallel_rank()
+            shard_size = hidden_states.shape[0]
+            if pad_size > 0:
+                residual = torch.nn.functional.pad(residual, (0, 0, 0, pad_size))
+            residual = residual.narrow(0, tp_rank * shard_size, shard_size)
+
+        # --- MLP ---
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual
+        )
+
+        # gate_up_proj: AG + GEMM
+        gate_up, _ = self.mlp.gate_up_proj.forward_ag_gemm(hidden_states)
+        x = self.mlp.act_fn(gate_up)
+        # down_proj: GEMM + RS
+        hidden_states = self.mlp.down_proj.forward_gemm_rs(x)
+
+        # Mark as scattered for next layer
+        hidden_states._async_tp_scattered = True
         return hidden_states, residual
 
     def _forward_async_tp(
@@ -382,11 +508,36 @@ class LlamaDecoderLayer(nn.Module):
         - MLP AG+GEMM and GEMM+RS naturally work on padded sizes
         """
         num_tokens = positions.shape[0]
+        hidden_state_meta = AsyncTpTensor.from_tensor(
+            hidden_states,
+            logical_num_tokens=num_tokens,
+            tp_size=self.tp_size,
+        )
+        is_scattered = hidden_state_meta.is_scattered()
 
-        # Only use async TP for prefill where GEMMs are large enough to
-        # benefit from compute-communication overlap. Decode GEMMs are tiny
-        # (M=1) and the fused op overhead causes 2-3x regression.
-        if num_tokens == 0 or forward_batch.forward_mode.is_decode():
+        decode_min_tokens = get_async_tp_min_tokens("decode")
+        decode_layer_min_tokens = max(
+            decode_min_tokens,
+            get_async_tp_min_tokens("ag"),
+            get_async_tp_min_tokens("rs"),
+        )
+        use_decode_async_tp = (
+            forward_batch.forward_mode.is_decode()
+            and num_tokens >= decode_layer_min_tokens
+        )
+        if (
+            forward_batch.forward_mode.is_decode()
+            and not use_decode_async_tp
+            and decode_layer_min_tokens > 0
+        ):
+            log_async_tp_decision_once(
+                f"llama_decode_fallback:{self.self_attn.attn.layer_id}:{num_tokens}:{decode_layer_min_tokens}",
+                f"{self.self_attn.attn.layer_id=}: fallback to standard decode path because num_tokens={num_tokens}<decode_layer_min_tokens={decode_layer_min_tokens}",
+            )
+
+        if num_tokens == 0 or (
+            forward_batch.forward_mode.is_decode() and not use_decode_async_tp
+        ):
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
@@ -394,7 +545,7 @@ class LlamaDecoderLayer(nn.Module):
                 hidden_states, residual = self.input_layernorm(
                     hidden_states, residual
                 )
-            hidden_states = self.self_attn(
+            hidden_states, _ = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
@@ -402,31 +553,34 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
-            hidden_states = self.mlp(hidden_states)
+            hidden_states, _ = self.mlp(hidden_states)
             return hidden_states, residual
-
-        # Detect if hidden_states is already scattered from previous layer.
-        # Cannot rely solely on shape when shard_size == num_tokens (e.g. decode M=1).
-        is_scattered = getattr(
-            hidden_states, "_async_tp_scattered", False
-        ) or hidden_states.shape[0] != num_tokens
 
         # Self Attention
         if residual is None:
             residual = hidden_states
+            residual_meta = hidden_state_meta.with_tensor(residual)
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            residual_meta = AsyncTpTensor.from_tensor(
+                residual,
+                logical_num_tokens=num_tokens,
+                tp_size=self.tp_size,
+            )
 
-        hidden_states = self.self_attn(
+        hidden_states, attn_used_async_rs = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             use_async_tp=True,
             is_scattered=is_scattered,
         )
-        # After o_proj GEMM+RS: hidden_states is [shard_size, H]
-        # where shard_size = ceil(M / tp_size)
+        if attn_used_async_rs:
+            hidden_state_meta = hidden_state_meta.mark_scattered(hidden_states)
+        else:
+            hidden_state_meta = hidden_state_meta.with_tensor(hidden_states)
+        hidden_states = hidden_state_meta.attach()
 
         # Scatter residual to match if not already scattered
         if not is_scattered:
@@ -439,16 +593,33 @@ class LlamaDecoderLayer(nn.Module):
                     residual, (0, 0, 0, pad_size)
                 )
             residual = residual.narrow(0, tp_rank * shard_size, shard_size)
+            residual_meta = residual_meta.mark_scattered(
+                residual,
+                padded_num_tokens=hidden_state_meta.padded_num_tokens,
+            )
+        else:
+            residual_meta = residual_meta.with_tensor(residual)
+        residual = residual_meta.attach()
 
         # Fully Connected (both hidden_states and residual are scattered)
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual
         )
-        hidden_states = self.mlp(
+        hidden_state_meta = hidden_state_meta.with_tensor(hidden_states)
+        residual_meta = residual_meta.with_tensor(residual)
+        hidden_states = hidden_state_meta.attach()
+        residual = residual_meta.attach()
+        hidden_states, mlp_used_async_rs = self.mlp(
             hidden_states, use_async_tp=True, is_scattered=True
         )
-        # Mark output as scattered so next layer detects it even if shard_size == M
-        hidden_states._async_tp_scattered = True
+        if mlp_used_async_rs:
+            hidden_states = hidden_state_meta.mark_scattered(
+                hidden_states,
+                padded_num_tokens=hidden_state_meta.padded_num_tokens,
+            ).attach()
+        else:
+            hidden_states = hidden_state_meta.with_tensor(hidden_states).attach()
+        residual = residual_meta.attach()
         return hidden_states, residual
 
 
@@ -489,6 +660,35 @@ class LlamaModel(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
         self.layers_to_capture = []
+
+    def _finalize_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        hidden_state_meta = AsyncTpTensor.from_tensor(
+            hidden_states,
+            logical_num_tokens=num_tokens,
+            tp_size=get_tensor_model_parallel_world_size(),
+        )
+
+        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_state_meta = hidden_state_meta.with_tensor(hidden_states)
+
+        if not hidden_state_meta.is_scattered():
+            return hidden_states
+
+        tp_group = get_tp_group()
+        gathered_size = hidden_state_meta.padded_num_tokens
+        full_hidden = torch.empty(
+            gathered_size,
+            hidden_states.shape[-1],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        tp_group.all_gather_into_tensor(full_hidden, hidden_states)
+        return full_hidden[:num_tokens]
 
     def forward(
         self,
@@ -531,30 +731,11 @@ class LlamaModel(nn.Module):
                 }
             )
         else:
-            # Async TP: hidden_states/residual may be scattered [shard_size, H].
-            # AllGather back to [M, H] before final norm and LM head.
-            if getattr(hidden_states, "_async_tp_scattered", False) or \
-                    hidden_states.shape[0] != positions.shape[0]:
-                tp_group = get_tp_group()
-                shard_size = hidden_states.shape[0]
-                gathered_size = shard_size * tp_group.world_size
-                num_tokens = positions.shape[0]
-
-                full_hidden = torch.empty(
-                    gathered_size, hidden_states.shape[-1],
-                    dtype=hidden_states.dtype, device=hidden_states.device,
-                )
-                tp_group.all_gather_into_tensor(full_hidden, hidden_states)
-                hidden_states = full_hidden[:num_tokens]
-
-                full_residual = torch.empty(
-                    gathered_size, residual.shape[-1],
-                    dtype=residual.dtype, device=residual.device,
-                )
-                tp_group.all_gather_into_tensor(full_residual, residual)
-                residual = full_residual[:num_tokens]
-
-            hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states = self._finalize_hidden_states(
+                hidden_states,
+                residual,
+                positions.shape[0],
+            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -719,9 +900,10 @@ class LlamaForCausalLM(nn.Module):
             )
 
         if end == self.model.config.num_hidden_layers:
-            # norm
-            hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
+            hidden_states = self.model._finalize_hidden_states(
+                forward_batch.hidden_states,
+                forward_batch.residual,
+                positions.shape[0],
             )
             forward_batch.hidden_states = hidden_states
             # logits process
