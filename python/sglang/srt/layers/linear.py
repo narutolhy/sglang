@@ -505,23 +505,44 @@ class ColumnParallelLinear(LinearBase):
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
-    def forward_ag_gemm(self, input_shard: torch.Tensor):
+    def forward_ag_gemm(
+        self, input_shard: torch.Tensor, use_fused: bool = False
+    ):
         """AllGather + GEMM: compile-compatible sequence parallelism.
 
-        AllGathers scattered input [M/tp, K] back to [M, K], then does GEMM.
-        Uses reg_all_gather_into_tensor (custom_op, NOT split_op) so it
-        stays inside compiled graphs / CUDA graph capture.
+        If use_fused=True, tries to use symm_mem fused AG+GEMM op (registered
+        as custom_op for torch.compile compatibility). Falls back to sequential
+        AG then GEMM if fused ops are unavailable.
 
         Returns: (output, output_bias) where output is [M, N/tp].
         """
+        bias = self.bias if not self.skip_bias_add else None
+
+        # Try fused AG+GEMM (pipelined overlap inside the op)
+        if use_fused and self.tp_size > 1:
+            from sglang.srt.layers.async_tp import (
+                is_fused_ag_gemm_available,
+                reg_fused_ag_gemm,
+            )
+
+            if is_fused_ag_gemm_available():
+                tp_group = get_tp_group()
+                group_name = tp_group.device_group.group_name
+                output = reg_fused_ag_gemm(
+                    input_shard, self.weight, group_name
+                )
+                if bias is not None:
+                    output = output + bias
+                output_bias = self.bias if self.skip_bias_add else None
+                return output, output_bias
+
+        # Sequential AG then GEMM
         tp_group = get_tp_group()
         gathered = input_shard.new_empty(
             input_shard.shape[0] * self.tp_size, input_shard.shape[1]
         )
         tp_group.all_gather_into_tensor(gathered, input_shard)
 
-        # Standard GEMM on gathered input
-        bias = self.bias if not self.skip_bias_add else None
         output_parallel = self.quant_method.apply(self, gathered, bias)
         if self.gather_output:
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -1625,12 +1646,14 @@ class RowParallelLinear(LinearBase):
 
         return output, output_bias
 
-    def forward_gemm_rs(self, input_: torch.Tensor) -> torch.Tensor:
+    def forward_gemm_rs(
+        self, input_: torch.Tensor, use_fused: bool = False
+    ) -> torch.Tensor:
         """GEMM + ReduceScatter: compile-compatible sequence parallelism.
 
-        Does GEMM without AllReduce, then ReduceScatter the result.
-        Uses reg_reduce_scatter_tensor (custom_op, NOT split_op) so it
-        stays inside compiled graphs / CUDA graph capture.
+        If use_fused=True, tries to use symm_mem fused GEMM+RS op (registered
+        as custom_op for torch.compile compatibility). Falls back to sequential
+        GEMM then RS if fused ops are unavailable.
 
         Returns: [M/tp, N] scattered output.
         """
@@ -1643,9 +1666,26 @@ class RowParallelLinear(LinearBase):
             input_parallel = splitted_input[self.tp_rank].contiguous()
 
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
-        # ReduceScatter instead of AllReduce
+        # Try fused GEMM+RS (pipelined overlap inside the op)
+        if use_fused and self.tp_size > 1:
+            from sglang.srt.layers.async_tp import (
+                is_fused_gemm_rs_available,
+                reg_fused_gemm_rs,
+            )
+
+            if is_fused_gemm_rs_available():
+                tp_group = get_tp_group()
+                group_name = tp_group.device_group.group_name
+                output = reg_fused_gemm_rs(
+                    input_parallel, self.weight, group_name
+                )
+                if bias_ is not None:
+                    output = output + bias_
+                return output
+
+        # Sequential GEMM then RS
+        output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
         tp_group = get_tp_group()
         local_rows = output_parallel.shape[0] // self.tp_size
         output_rs = output_parallel.new_empty(local_rows, output_parallel.shape[1])

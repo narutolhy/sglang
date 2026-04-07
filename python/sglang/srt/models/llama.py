@@ -32,8 +32,6 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.async_tp import (
     AsyncTpTensor,
-    get_async_tp_min_tokens,
-    log_async_tp_decision_once,
     should_use_async_tp_reduce_scatter,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -444,9 +442,11 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         # --- Self Attention ---
-        # qkv_proj: AG + GEMM if scattered
+        # qkv_proj: AG + GEMM if scattered (fused op overlaps AG with GEMM)
         if is_scattered:
-            qkv, _ = self.self_attn.qkv_proj.forward_ag_gemm(hidden_states)
+            qkv, _ = self.self_attn.qkv_proj.forward_ag_gemm(
+                hidden_states, use_fused=True
+            )
             # AG gathers to padded_m; truncate to M for attention
             if qkv.shape[0] > num_tokens:
                 qkv = qkv[:num_tokens]
@@ -460,13 +460,15 @@ class LlamaDecoderLayer(nn.Module):
 
         attn_output = self.self_attn.attn(q, k, v, forward_batch)
 
-        # o_proj: GEMM + RS
+        # o_proj: GEMM + RS (fused op overlaps GEMM with RS)
         # Pad to nearest multiple of tp_size for RS
         tp_size = self.tp_size
         pad_size = (tp_size - attn_output.shape[0] % tp_size) % tp_size
         if pad_size > 0:
             attn_output = torch.nn.functional.pad(attn_output, (0, 0, 0, pad_size))
-        hidden_states = self.self_attn.o_proj.forward_gemm_rs(attn_output)
+        hidden_states = self.self_attn.o_proj.forward_gemm_rs(
+            attn_output, use_fused=True
+        )
 
         # Scatter residual to match
         if not is_scattered:
@@ -481,11 +483,13 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states, residual
         )
 
-        # gate_up_proj: AG + GEMM
-        gate_up, _ = self.mlp.gate_up_proj.forward_ag_gemm(hidden_states)
+        # gate_up_proj: AG + GEMM (fused op overlaps AG with GEMM)
+        gate_up, _ = self.mlp.gate_up_proj.forward_ag_gemm(
+            hidden_states, use_fused=True
+        )
         x = self.mlp.act_fn(gate_up)
-        # down_proj: GEMM + RS
-        hidden_states = self.mlp.down_proj.forward_gemm_rs(x)
+        # down_proj: GEMM + RS (fused op overlaps GEMM with RS)
+        hidden_states = self.mlp.down_proj.forward_gemm_rs(x, use_fused=True)
 
         # Mark as scattered for next layer
         hidden_states._async_tp_scattered = True
@@ -513,29 +517,7 @@ class LlamaDecoderLayer(nn.Module):
         )
         is_scattered = hidden_state_meta.is_scattered()
 
-        decode_min_tokens = get_async_tp_min_tokens("decode")
-        decode_layer_min_tokens = max(
-            decode_min_tokens,
-            get_async_tp_min_tokens("ag"),
-            get_async_tp_min_tokens("rs"),
-        )
-        use_decode_async_tp = (
-            forward_batch.forward_mode.is_decode()
-            and num_tokens >= decode_layer_min_tokens
-        )
-        if (
-            forward_batch.forward_mode.is_decode()
-            and not use_decode_async_tp
-            and decode_layer_min_tokens > 0
-        ):
-            log_async_tp_decision_once(
-                f"llama_decode_fallback:{self.self_attn.attn.layer_id}:{num_tokens}:{decode_layer_min_tokens}",
-                f"{self.self_attn.attn.layer_id=}: fallback to standard decode path because num_tokens={num_tokens}<decode_layer_min_tokens={decode_layer_min_tokens}",
-            )
-
-        if num_tokens == 0 or (
-            forward_batch.forward_mode.is_decode() and not use_decode_async_tp
-        ):
+        if num_tokens == 0 or forward_batch.forward_mode.is_decode():
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)

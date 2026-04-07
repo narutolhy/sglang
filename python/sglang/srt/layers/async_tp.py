@@ -563,3 +563,117 @@ def fused_all_gather_matmul(
     return _fused_all_gather_matmul_symm_mem(
         input_shard, weights, group_name, gather_dim=gather_dim
     )
+
+
+# ---------------------------------------------------------------------------
+# Compile-compatible fused ops (registered as custom_ops, opaque to dynamo)
+# ---------------------------------------------------------------------------
+
+_fused_ops_registered = False
+
+
+def _ensure_fused_ops_registered():
+    """Register symm_mem fused ops as torch custom_ops (once).
+
+    The raw symm_mem ops call c10d._resolve_process_group() which breaks
+    torch.compile/dynamo. Wrapping them as custom_ops makes them opaque
+    to dynamo, while still getting the internal GEMM+RS/AG pipelining.
+    """
+    global _fused_ops_registered
+    if _fused_ops_registered:
+        return True
+    if not _init_fused_ops():
+        return False
+
+    from sglang.srt.utils.custom_op import register_custom_op
+
+    @register_custom_op(
+        op_name="fused_gemm_rs",
+        mutates_args=[],
+        fake_impl=_fake_fused_gemm_rs,
+    )
+    def _fused_gemm_rs_impl(
+        input: torch.Tensor, weight: torch.Tensor, group_name: str
+    ) -> torch.Tensor:
+        M = input.shape[0]
+        tp_size = _get_tp_world_size(group_name)
+        pad_size = (tp_size - M % tp_size) % tp_size
+        if pad_size > 0:
+            input = torch.nn.functional.pad(input, (0, 0, 0, pad_size))
+        A = _restride_mrs(input, 0)
+        weight_t = weight.T.contiguous()
+        output = _fused_mrs(
+            A, weight_t, "sum", scatter_dim=0, group_name=group_name
+        )
+        # Unpad: each rank got (M+pad)/tp rows, we need ceil(M/tp)
+        if pad_size > 0:
+            output = output[: (M + tp_size - 1) // tp_size]
+        return output
+
+    @register_custom_op(
+        op_name="fused_ag_gemm",
+        mutates_args=[],
+        fake_impl=_fake_fused_ag_gemm,
+    )
+    def _fused_ag_gemm_impl(
+        input_shard: torch.Tensor, weight: torch.Tensor, group_name: str
+    ) -> torch.Tensor:
+        A_shard = _restride_agm(input_shard, 0)
+        weight_t = weight.T.contiguous()
+        _, mm_outputs = _fused_agm(
+            A_shard,
+            [weight_t],
+            gather_dim=0,
+            group_name=group_name,
+            return_A=False,
+        )
+        return mm_outputs[0]
+
+    _fused_ops_registered = True
+    logger.info("Registered compile-compatible fused GEMM+RS and AG+GEMM custom ops")
+    return True
+
+
+def _fake_fused_gemm_rs(
+    input: torch.Tensor, weight: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    """Fake impl for shape inference: [M, K] x [N, K]^T -> RS -> [ceil(M/tp), N]"""
+    M = input.shape[0]
+    N = weight.shape[0]
+    tp_size = _get_tp_world_size(group_name)
+    padded_m = M + (tp_size - M % tp_size) % tp_size
+    return input.new_empty(padded_m // tp_size, N)
+
+
+def _fake_fused_ag_gemm(
+    input_shard: torch.Tensor, weight: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    """Fake impl for shape inference: AG([M/tp, K]) -> [M, K] x [N, K]^T -> [M, N]"""
+    tp_size = _get_tp_world_size(group_name)
+    M = input_shard.shape[0] * tp_size
+    N = weight.shape[0]
+    return input_shard.new_empty(M, N)
+
+
+def is_fused_gemm_rs_available() -> bool:
+    return _ensure_fused_ops_registered()
+
+
+def is_fused_ag_gemm_available() -> bool:
+    return _ensure_fused_ops_registered()
+
+
+def reg_fused_gemm_rs(
+    input: torch.Tensor, weight: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    """Compile-compatible fused GEMM+ReduceScatter."""
+    _ensure_fused_ops_registered()
+    return torch.ops.sglang.fused_gemm_rs(input, weight, group_name)
+
+
+def reg_fused_ag_gemm(
+    input_shard: torch.Tensor, weight: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    """Compile-compatible fused AllGather+GEMM."""
+    _ensure_fused_ops_registered()
+    return torch.ops.sglang.fused_ag_gemm(input_shard, weight, group_name)
