@@ -357,11 +357,9 @@ class LlamaDecoderLayer(nn.Module):
             and self.tp_size > 1
         )
         # Compile-compatible SP mode: uses plain RS/AG custom_ops
-        # instead of fused symm_mem ops that break torch.compile
-        self.use_compile_sp = (
-            self.use_async_tp
-            and not getattr(server_args, "disable_piecewise_cuda_graph", True)
-        )
+        # instead of fused symm_mem ops. Works in both eager and compile modes,
+        # but designed to be torch.compile-compatible (no c10d._resolve_process_group).
+        self.use_compile_sp = self.use_async_tp
 
     def forward(
         self,
