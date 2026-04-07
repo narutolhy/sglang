@@ -33,11 +33,6 @@ logger = logging.getLogger(__name__)
 
 def is_async_tp_pass_enabled() -> bool:
     """Check if the async TP FX pass should be applied."""
-    from sglang.srt.model_executor.forward_batch_info import global_server_args_dict
-
-    server_args = global_server_args_dict.get("server_args")
-    if server_args is not None:
-        return getattr(server_args, "enable_async_tp", False)
     return os.environ.get("SGLANG_ENABLE_ASYNC_TP_FX_PASS", "0") == "1"
 
 
