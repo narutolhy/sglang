@@ -31,7 +31,7 @@ class EagleServerBase(CustomTestCase):
     spec_steps = 5
     spec_topk = 8
     spec_tokens = 64
-    mem_fraction_static = 0.65
+    mem_fraction_static = 0.55
     extra_args = []
 
     @classmethod
