@@ -427,6 +427,9 @@ class PiecewiseCudaGraphRunner:
         # decoding), PCG replay would return wrong/missing hidden_states.
         if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
             return False
+        # Disable for token embedding overrides (dynamic per-request)
+        if forward_batch.replace_embeds is not None:
+            return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
@@ -619,7 +622,7 @@ class PiecewiseCudaGraphRunner:
             buffers.input_ids[num_tokens:static_num_tokens].zero_()
             buffers.positions[num_tokens:static_num_tokens].zero_()
             if self.is_multimodal:
-                buffers.input_embeds[:, num_tokens:static_num_tokens].zero_()
+                buffers.input_embeds[num_tokens:static_num_tokens].zero_()
             if forward_batch.mrope_positions is not None:
                 buffers.mrope_positions[:, num_tokens:static_num_tokens].zero_()
 
