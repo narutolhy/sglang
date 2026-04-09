@@ -422,6 +422,11 @@ class PiecewiseCudaGraphRunner:
         # so it must not use PCG-captured graphs.
         if forward_batch.forward_mode.is_target_verify():
             return False
+        # PCG graphs are captured with the runner's capture_hidden_mode.
+        # If the batch needs a different mode (e.g. FULL for speculative
+        # decoding), PCG replay would return wrong/missing hidden_states.
+        if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
+            return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
