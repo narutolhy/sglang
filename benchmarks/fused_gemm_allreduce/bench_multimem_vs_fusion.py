@@ -107,6 +107,7 @@ def main():
             allreduce_fusion_oneshot_lamport,
             init_custom_allreduce,
         )
+
         # Initialize custom allreduce
         init_custom_allreduce(rank, ws)
         has_flashinfer_ar = True

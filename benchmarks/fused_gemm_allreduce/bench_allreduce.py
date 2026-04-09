@@ -9,7 +9,10 @@ Tests multiple AllReduce implementations:
 Usage:
     torchrun --nproc_per_node=4 bench_allreduce.py
 """
-import argparse, os, time
+import argparse
+import os
+import time
+
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
