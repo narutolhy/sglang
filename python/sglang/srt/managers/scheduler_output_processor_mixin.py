@@ -171,6 +171,7 @@ class SchedulerOutputProcessorMixin:
 
             # Check finish conditions
             logprob_pt = 0
+            deferred_release_reqs = []
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.finished() or req.is_retracted:
@@ -188,7 +189,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        release_kv_cache(req, self.tree_cache)
+                        deferred_release_reqs.append(req)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
@@ -301,6 +302,7 @@ class SchedulerOutputProcessorMixin:
                     embeddings = [tensor.tolist() for tensor in embeddings]
 
             # Check finish conditions
+            deferred_release_reqs = []
             for i, req in enumerate(batch.reqs):
                 if req.is_retracted:
                     continue
@@ -313,7 +315,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
+                        deferred_release_reqs.append(req)
                         req.time_stats.set_completion_time()
                     else:
                         self.tree_cache.cache_unfinished_req(req)
@@ -322,7 +324,12 @@ class SchedulerOutputProcessorMixin:
                     req.is_chunked -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
+        # Stream output before releasing KV cache so results are returned ASAP.
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+
+        # Deferred KV cache release after streaming results.
+        for req in deferred_release_reqs:
+            release_kv_cache(req, self.tree_cache)
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
