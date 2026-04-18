@@ -123,6 +123,39 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
         )
+    elif a2a_backend.is_nvshmem():
+        from sglang.srt.layers.moe.token_dispatcher.nvshmem import (
+            NvshmemDispatcher,
+            NvshmemDispatcherConfig,
+        )
+
+        # Size the symm_mem buffers tightly — max_slots = max_tokens * top_k
+        # is what fused_experts churns through every call (including padding),
+        # so oversizing throws away the a2a speedup. Prefer cuda_graph_max_bs
+        # when graph capture is on (decode hot path); override via
+        # SGLANG_NVSHMEM_MAX_TOKENS for larger prefill batches.
+        import os
+
+        server_args = get_global_server_args()
+        cg_bs = getattr(server_args, "cuda_graph_max_bs", 0) or 0
+        # Upper-bound on incoming slots per rank = cg_bs (worst-case routing
+        # has all 4 senders ship every slot to one dest, which totals cg_bs *
+        # top_k at this rank). Use max(cg_bs, 32) as a floor for small-batch
+        # testing; override via SGLANG_NVSHMEM_MAX_TOKENS for larger prefill.
+        default_max = max(cg_bs, 32)
+        max_tokens = int(
+            os.environ.get("SGLANG_NVSHMEM_MAX_TOKENS", str(default_max))
+        )
+        return NvshmemDispatcher(
+            NvshmemDispatcherConfig(
+                num_experts=moe_runner_config.num_experts,
+                num_local_experts=moe_runner_config.num_local_experts,
+                hidden_size=moe_runner_config.hidden_size,
+                top_k=moe_runner_config.top_k,
+                max_tokens_per_rank=max_tokens,
+                dtype=moe_runner_config.params_dtype,
+            )
+        )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
 
@@ -345,6 +378,18 @@ class FusedMoE(torch.nn.Module):
         tp_rank: int,
         is_bias: bool = False,
     ):
+        # EP narrow: loaded_weight carries all num_experts along dim 0 but
+        # param.data only covers this rank's num_local_experts. Slice here
+        # so downstream TP narrows operate on the correct expert slab.
+        if (
+            self.moe_ep_size > 1
+            and expert_data.shape[0] == self.num_local_experts
+            and loaded_weight.shape[0] != expert_data.shape[0]
+        ):
+            ep_start = self.moe_ep_rank * self.num_local_experts
+            loaded_weight = loaded_weight.narrow(
+                0, ep_start, self.num_local_experts
+            )
         # Load grouped weight scales for group quantization
         # or model weights
         if shard_id == "w2":

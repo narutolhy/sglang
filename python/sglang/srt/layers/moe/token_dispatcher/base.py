@@ -164,6 +164,7 @@ class DispatchOutputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
+    NVSHMEM = "nvshmem"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -182,6 +183,9 @@ class DispatchOutputFormat(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DispatchOutputFormat.FLASHINFER
+
+    def is_nvshmem(self) -> bool:
+        return self == DispatchOutputFormat.NVSHMEM
 
 
 @runtime_checkable

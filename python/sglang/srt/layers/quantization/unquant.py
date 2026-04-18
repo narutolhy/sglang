@@ -399,6 +399,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+        # NVSHMEM dispatch gives us [M_recv, H] already-routed tokens; run the
+        # per-expert grouped GEMM path instead of the standard global-route one.
+        if dispatch_output.format.is_nvshmem():
+            from sglang.srt.layers.moe.token_dispatcher.nvshmem import (
+                run_nvshmem_moe,
+            )
+
+            return run_nvshmem_moe(layer, dispatch_output)
+
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
