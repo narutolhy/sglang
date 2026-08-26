@@ -68,21 +68,32 @@ class NixlEPBuffer:
                 connected_ep_size=None,
                 scale_to=None,
                 dispatch_ep_size=None,
+                pending_reconnect=None,
             )
             buffers["nixl_ep_state"] = state
         return state
 
     @classmethod
-    def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:
+    def on_scale(cls, from_ep_size: int, to_ep_size: int, refilled_ranks: list) -> None:
         """Schedule connections for newly admitted ranks."""
         state = cls._state()
         state.scale_to = to_ep_size
         state.dispatch_ep_size = to_ep_size
+        # A refilled slot below the connected watermark now holds a different
+        # process than the one we are connected to, so the append-only walk in
+        # _update_connections would skip it.
+        connected = state.connected_ep_size or 0
+        reconnect = [rank for rank in refilled_ranks if rank < connected]
+        if reconnect:
+            state.pending_reconnect = sorted(
+                set(state.pending_reconnect or []) | set(reconnect)
+            )
         logger.debug(
             "[Elastic EP][nixl] scheduling rank connections: old_ep_size=%d "
-            "new_ep_size=%d",
+            "new_ep_size=%d refilled=%s",
             from_ep_size,
             to_ep_size,
+            reconnect,
         )
 
     @classmethod
@@ -123,6 +134,9 @@ class NixlEPBuffer:
                 and state.scale_to > state.connected_ep_size
             ):
                 cls._update_connections(state, state.scale_to)
+            if state.pending_reconnect:
+                cls._connect_ranks(state, state.pending_reconnect, tag="refill")
+                state.pending_reconnect = None
             return state.buffer
 
         state.hidden_size = hidden_size
@@ -177,7 +191,11 @@ class NixlEPBuffer:
             num_experts_per_rank=state.num_local_experts,
             num_rdma_bytes=num_rdma_bytes,
         )
-        initial_ep_size = offset + world_size
+        # A cohort refilling a hole owns only part of a world that is already
+        # wider than its own ranks, so connect the whole effective world.
+        initial_ep_size = max(
+            offset + world_size, ElasticEPStateManager.get_effective_ep_size()
+        )
         scale_to = max(initial_ep_size, state.scale_to or 0)
         cls._connect_ranks(state, list(range(scale_to)), tag="initial")
         state.connected_ep_size = scale_to

@@ -409,6 +409,14 @@ def handle_elastic_ep(server_args: Any):
                 "--elastic-ep-join-rank-offset set to the current "
                 "effective EP size."
             )
+    if cfg.ep_join_world_size is not None:
+        assert cfg.ep_join_mode == "scale", (
+            "--elastic-ep-join-world-size is only valid with "
+            "--elastic-ep-join-mode scale."
+        )
+        assert cfg.ep_join_world_size > 0, (
+            "--elastic-ep-join-world-size must be a positive integer."
+        )
     if cfg.ep_join_rank_offset != 0:
         assert cfg.ep_join_mode == "scale", (
             "--elastic-ep-join-rank-offset is only valid with "
@@ -456,12 +464,25 @@ def handle_elastic_ep(server_args: Any):
                 "Elastic EP scale joiners require --elastic-ep-initial-size "
                 "set to the primary deployment's launch-time EP size."
             )
-            assert cfg.elastic_ep_initial_size <= cfg.ep_join_rank_offset, (
-                "--elastic-ep-initial-size cannot exceed the current EP size "
-                f"(initial={cfg.elastic_ep_initial_size}, "
-                f"current={cfg.ep_join_rank_offset})."
+            join_world_size = cfg.ep_join_world_size
+            if join_world_size is None:
+                assert cfg.elastic_ep_initial_size <= cfg.ep_join_rank_offset, (
+                    "--elastic-ep-initial-size cannot exceed the current EP "
+                    f"size (initial={cfg.elastic_ep_initial_size}, "
+                    f"current={cfg.ep_join_rank_offset}). Set "
+                    "--elastic-ep-join-world-size to refill slots inside the "
+                    "current world instead of appending to it."
+                )
+            else:
+                assert cfg.ep_join_rank_offset + cfg.tp_size <= join_world_size, (
+                    "A refilling cohort must fit inside the world it joins "
+                    f"(offset={cfg.ep_join_rank_offset}, "
+                    f"tp_size={cfg.tp_size}, "
+                    f"join_world_size={join_world_size})."
+                )
+            join_target = max(
+                cfg.ep_join_rank_offset + cfg.tp_size, join_world_size or 0
             )
-            join_target = cfg.ep_join_rank_offset + cfg.tp_size
             assert join_target <= cfg.max_ep_size, (
                 "Elastic EP joining group exceeds --max-ep-size "
                 f"(join_target={join_target}, max_ep_size={cfg.max_ep_size})."

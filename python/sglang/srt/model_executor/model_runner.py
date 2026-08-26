@@ -41,12 +41,14 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
+    auto_rank_recovery_supported,
+    clear_scale_cohort,
     get_healthy_expert_location_src_rank,
-    get_scale_cohort_target,
     join_process_groups,
     join_scale_process_group,
     maybe_rebalance_after_rank_fault,
     maybe_recover_ep_ranks,
+    plan_joining_cohort,
     register_scale_cohort,
     try_admit_scale_ranks,
 )
@@ -500,12 +502,12 @@ class ModelRunner:
         ):
             return
 
-        join_effective_ep_size = get_parallel().ep_join_rank_offset + self.ps.tp_size
+        join_effective_ep_size = ElasticEPStateManager.get_effective_ep_size()
         dist.barrier(group=self.tp_group.cpu_group)
         if self.ps.tp_rank == 0:
             register_scale_cohort(
                 get_parallel().ep_join_rank_offset,
-                join_effective_ep_size,
+                self.ps.tp_size,
             )
         join_scale_process_group()
         get_context().override("elastic_ep.scale_join", ep_size=join_effective_ep_size)
@@ -2089,11 +2091,7 @@ class ModelRunner:
         self.forward_pass_id = 0
         ElasticEPStateManager.mark_configuring_data_plane()
 
-        state = ElasticEPStateManager.instance()
-        for rank in ranks_to_join:
-            state.active_ranks[rank] = 1
-        state.snapshot_active_to_last()
-        state.sync_active_to_cpu()
+        ElasticEPStateManager.mark_scale_slots_active()
         if self.eplb_manager is not None:
             self.eplb_manager.reset_generator()
 
@@ -2107,7 +2105,7 @@ class ModelRunner:
             src_rank=0,
         )
 
-        ElasticEPStateManager.on_scale(effective_size, target_size)
+        ElasticEPStateManager.on_scale(effective_size, target_size, ranks_to_join)
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
                 get_global_expert_location_metadata(),
@@ -2140,11 +2138,12 @@ class ModelRunner:
         if self.ps.tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
             from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
+            clear_scale_cohort(ElasticEPStateManager.get_pending_rank_offset())
             self._pending_elastic_scale_update = ElasticScaleUpdateReq(
                 success=True,
                 effective_ep_size=target_size,
-                slot_offset=effective_size,
-                slot_count=target_size - effective_size,
+                slot_offset=ranks_to_join[0],
+                slot_count=len(ranks_to_join),
             )
             logger.info(
                 "[Elastic EP] Scale completed: old_ep_size=%d "
@@ -2163,15 +2162,9 @@ class ModelRunner:
         pending_size = ElasticEPStateManager.get_pending_ep_size()
 
         if pending_size is None:
-            if state is not None and state.has_scaled:
-                error = (
-                    "Elastic EP rank recovery is unsupported after runtime scale-up. "
-                    "Restart the expanded deployment."
-                )
-                ElasticEPStateManager.fail_recovery(error)
-                self._report_elastic_scale_failure(error, effective_size)
-                if self.ps.tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
-                    logger.error("[Elastic EP] %s", error)
+            # In an expanded world the holes are refilled by pointing a joining
+            # cohort at them, not by the launch-time recovery path.
+            if not auto_rank_recovery_supported():
                 return
 
             recovered = maybe_recover_ep_ranks(
@@ -2201,24 +2194,21 @@ class ModelRunner:
             return
 
         if state.scale_phase == "waiting_for_cohort":
-            cohort_target = get_scale_cohort_target(effective_size)
-            if cohort_target is None:
+            plan = plan_joining_cohort(pending_size)
+            if plan is None:
                 return
-            if cohort_target != pending_size:
-                error = (
-                    f"Requested target EP size {pending_size} does not match "
-                    f"joining cohort target {cohort_target}"
-                )
-                ElasticEPStateManager.fail_scale(error)
+            if plan.error is not None:
+                ElasticEPStateManager.fail_scale(plan.error)
                 self._reset_eplb_after_elastic_scale_failure()
-                self._report_elastic_scale_failure(error, effective_size)
+                self._report_elastic_scale_failure(plan.error, effective_size)
                 if self.ps.tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
-                    logger.error("[Elastic EP] %s", error)
+                    logger.error("[Elastic EP] %s", plan.error)
+                    clear_scale_cohort(plan.rank_offset)
                 return
-            if not ElasticEPStateManager.begin_scale():
+            if not ElasticEPStateManager.begin_scale(plan):
                 return
 
-        ranks_to_join = list(range(effective_size, pending_size))
+        ranks_to_join = ElasticEPStateManager.get_pending_slots()
         if not ranks_to_join:
             return
 

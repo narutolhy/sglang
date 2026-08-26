@@ -26,14 +26,27 @@ logger = logging.getLogger(__name__)
 _SCALE_COHORT_KEY_PREFIX = "elastic_ep/scale_cohort"
 
 
-def register_scale_cohort(rank_offset: int, target_ep_size: int) -> None:
+def register_scale_cohort(rank_offset: int, cohort_size: int) -> None:
+    """Announce a cohort occupying ``cohort_size`` slots from ``rank_offset``."""
     store = get_global_tcp_store()
     if store is None:
         raise RuntimeError("Elastic EP scale-up requires the global TCPStore.")
-    store.set(f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}", str(target_ep_size).encode())
+    store.set(f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}", str(cohort_size).encode())
 
 
-def get_scale_cohort_target(rank_offset: int) -> Optional[int]:
+def clear_scale_cohort(rank_offset: int) -> None:
+    """Drop a consumed cohort announcement.
+
+    The key is named after the slot offset, so a later cohort refilling the same
+    slots would otherwise match the departed cohort's stale announcement.
+    """
+    store = get_global_tcp_store()
+    if store is None:
+        return
+    store.delete_key(f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}")
+
+
+def _get_scale_cohort_size(rank_offset: int) -> Optional[int]:
     store = get_global_tcp_store()
     if store is None:
         return None
@@ -41,6 +54,20 @@ def get_scale_cohort_target(rank_offset: int) -> Optional[int]:
     if not store.check([key]):
         return None
     return int(store.get(key).decode())
+
+
+def find_joining_cohort() -> Optional[tuple[int, int]]:
+    """Locate a registered cohort for the first slot region it can fill.
+
+    Returns ``(rank_offset, cohort_size)``. Holes left by departed ranks are
+    offered before the top of the rank space, so a scale that only refills holes
+    leaves the EP size unchanged.
+    """
+    for offset in ElasticEPStateManager.get_scale_slot_candidates():
+        cohort_size = _get_scale_cohort_size(offset)
+        if cohort_size is not None:
+            return offset, cohort_size
+    return None
 
 
 @dataclass
@@ -56,6 +83,8 @@ class ElasticEPState:
     original_ep_size: int = 0
     has_scaled: bool = False
     ep_join_rank_offset: int = 0
+    pending_slots: Optional[tuple] = None
+    pending_rank_offset: int = 0
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
@@ -70,9 +99,10 @@ class ElasticEPState:
 
     def reset(self):
         if self.active_ranks is not None:
-            # Reserved slots stay inactive until their ranks join.
-            self.active_ranks.zero_()
-            self.active_ranks[: self.effective_ep_size] = 1
+            # Reserved slots stay inactive until their ranks join, and so do
+            # slots whose rank departed: a scale that refills only some of the
+            # holes must not declare the rest healthy.
+            self.active_ranks[self.effective_ep_size :] = 0
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
 
@@ -119,25 +149,35 @@ class ElasticEPStateManager:
 
     @classmethod
     def _init_joiner_state(cls, inst: ElasticEPState) -> None:
-        global_rank = torch.distributed.get_rank()
+        """Correct a freshly built state for a process that joins an existing world.
+
+        A *recover* joiner needs no correction. It is launched with the world it
+        is rejoining, so ``init`` has already sized the state to that world and
+        marked every rank of it healthy -- which is the truth it is about to
+        confirm by rejoining. Zeroing that mask here and rebuilding it in
+        ``reset`` later was a round trip that only worked while ``reset`` still
+        re-activated everything below the effective size.
+        """
+        if get_exec().moe.ep_join_mode != "scale":
+            return
+
+        # A scale joiner is not part of the world it joins: the ranks already
+        # serving there are not its own, so it starts knowing only itself and
+        # the primary admits the rest when the cohort is matched.
         inst.active_ranks.zero_()
-        inst.active_ranks[global_rank] = 1
+        inst.active_ranks[torch.distributed.get_rank()] = 1
         inst.snapshot_active_to_last()
         inst.sync_active_to_cpu()
 
-        if get_exec().moe.ep_join_mode == "scale":
-            inst.effective_ep_size = (
-                get_parallel().ep_join_rank_offset + get_parallel().tp_size
-            )
-            inst.original_ep_size = (
-                get_parallel().elastic_ep_initial_size
-                or get_parallel().ep_join_rank_offset
-            )
-            inst.has_scaled = True
-        else:
-            world_size = torch.distributed.get_world_size()
-            inst.effective_ep_size = world_size
-            inst.original_ep_size = world_size
+        # A cohort refilling a hole sits inside a world that is already larger
+        # than the slots it occupies.
+        inst.effective_ep_size = get_parallel().ep_join_world_size or (
+            get_parallel().ep_join_rank_offset + get_parallel().tp_size
+        )
+        inst.original_ep_size = (
+            get_parallel().elastic_ep_initial_size or get_parallel().ep_join_rank_offset
+        )
+        inst.has_scaled = True
 
     @staticmethod
     def _select_device() -> torch.device:
@@ -173,10 +213,7 @@ class ElasticEPStateManager:
         inst = cls._instance
         if inst is None:
             return False
-        if (
-            inst.pending_ep_size is not None
-            or inst.scale_phase == "recovery_unsupported"
-        ):
+        if inst.pending_ep_size is not None:
             return False
         inst.pending_ep_size = n
         inst.scale_phase = "waiting_for_cohort"
@@ -185,7 +222,7 @@ class ElasticEPStateManager:
         return True
 
     @classmethod
-    def begin_scale(cls) -> bool:
+    def begin_scale(cls, plan: ScaleCohortPlan) -> bool:
         inst = cls._instance
         if (
             inst is None
@@ -193,8 +230,24 @@ class ElasticEPStateManager:
             or inst.scale_phase != "waiting_for_cohort"
         ):
             return False
+        # The slots are resolved once, here: later phases must fill exactly the
+        # cohort that was matched, not whatever the rank mask looks like then.
+        inst.pending_slots = tuple(plan.slots)
+        inst.pending_rank_offset = plan.rank_offset
         inst.scale_phase = "pending"
         return True
+
+    @classmethod
+    def get_pending_slots(cls) -> List[int]:
+        inst = cls._instance
+        if inst is None or inst.pending_slots is None:
+            return []
+        return list(inst.pending_slots)
+
+    @classmethod
+    def get_pending_rank_offset(cls) -> int:
+        inst = cls._instance
+        return 0 if inst is None else inst.pending_rank_offset
 
     @classmethod
     def mark_joining(cls) -> None:
@@ -215,12 +268,34 @@ class ElasticEPStateManager:
             inst.scale_phase = phase
 
     @classmethod
+    def mark_ranks_active(cls, ranks: List[int]) -> None:
+        """Bring recovered or newly joined slots online.
+
+        Deliberately does not call ``reset``: a growing cohort is activated
+        before ``commit_scale`` raises the effective EP size, so clearing
+        reserved slots here would zero the very ranks just admitted.
+        """
+        inst = cls._instance
+        if inst is None or inst.active_ranks is None:
+            return
+        for rank in ranks:
+            inst.active_ranks[rank] = 1
+        inst.snapshot_active_to_last()
+        inst.sync_active_to_cpu()
+
+    @classmethod
+    def mark_scale_slots_active(cls) -> None:
+        """Bring the matched cohort's slots online."""
+        cls.mark_ranks_active(cls.get_pending_slots())
+
+    @classmethod
     def commit_scale(cls) -> None:
         inst = cls._instance
         if inst is None or inst.pending_ep_size is None:
             return
         inst.effective_ep_size = inst.pending_ep_size
         inst.pending_ep_size = None
+        inst.pending_slots = None
         inst.has_scaled = True
         inst.scale_phase = "serving_expanded"
         inst.last_error = None
@@ -236,15 +311,12 @@ class ElasticEPStateManager:
         inst.scale_phase = "failed"
         inst.last_error = error
         inst.pending_since = None
+        # Roll the half-admitted cohort back out so its slots stay refillable.
+        if inst.pending_slots is not None and inst.active_ranks is not None:
+            for rank in inst.pending_slots:
+                inst.active_ranks[rank] = 0
+            inst.pending_slots = None
         inst.reset()
-
-    @classmethod
-    def fail_recovery(cls, error: str) -> None:
-        inst = cls._instance
-        if inst is None:
-            return
-        inst.scale_phase = "recovery_unsupported"
-        inst.last_error = error
 
     @classmethod
     def get_effective_ep_size(cls) -> int:
@@ -281,31 +353,82 @@ class ElasticEPStateManager:
         return inst.ep_join_rank_offset
 
     @classmethod
-    def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:
+    def on_scale(
+        cls, from_ep_size: int, to_ep_size: int, refilled_ranks: List[int]
+    ) -> None:
         if cls._on_scale is not None:
-            cls._on_scale(from_ep_size, to_ep_size)
+            cls._on_scale(from_ep_size, to_ep_size, refilled_ranks)
 
     @staticmethod
-    def _on_scale_nixl(from_ep_size: int, to_ep_size: int) -> None:
+    def _on_scale_nixl(
+        from_ep_size: int, to_ep_size: int, refilled_ranks: List[int]
+    ) -> None:
         from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
 
-        NixlEPBuffer.on_scale(from_ep_size, to_ep_size)
+        NixlEPBuffer.on_scale(from_ep_size, to_ep_size, refilled_ranks)
 
     @classmethod
-    def is_scaling(cls) -> bool:
-        """Return whether a scale or recovery operation is pending.
+    def is_scale_pending(cls) -> bool:
+        """Return whether a scale request is in flight."""
+        inst = cls._instance
+        return inst is not None and inst.pending_ep_size is not None
+
+    @classmethod
+    def get_inactive_ranks(cls) -> List[int]:
+        """Slots below the effective EP size whose rank stopped serving.
 
         The CPU snapshot is authoritative because rank polling uses it too.
         """
         inst = cls._instance
         if inst is None or inst.active_ranks_cpu is None:
-            return False
-        if inst.scale_phase == "recovery_unsupported":
-            return False
-        if inst.pending_ep_size is not None:
-            return True
-        active_count = int(inst.active_ranks_cpu[: inst.effective_ep_size].sum().item())
-        return active_count < inst.effective_ep_size
+            return []
+        mask = inst.active_ranks_cpu[: inst.effective_ep_size].tolist()
+        return [rank for rank, active in enumerate(mask) if not active]
+
+    @classmethod
+    def has_inactive_ranks(cls) -> bool:
+        return bool(cls.get_inactive_ranks())
+
+    @classmethod
+    def get_scale_slot_candidates(cls) -> List[int]:
+        """Offsets a joining cohort may start at, holes first.
+
+        Only the start of each contiguous run of holes is offered: a cohort owns
+        consecutive global ranks, so it cannot straddle a rank that is still
+        serving.
+        """
+        inactive = cls.get_inactive_ranks()
+        candidates = [
+            rank
+            for index, rank in enumerate(inactive)
+            if index == 0 or inactive[index - 1] != rank - 1
+        ]
+        candidates.append(cls.get_effective_ep_size())
+        return candidates
+
+    @classmethod
+    def resolve_scale_slots(
+        cls, rank_offset: int, cohort_size: int
+    ) -> Optional[tuple[List[int], int]]:
+        """Slots a cohort fills and the EP size that results, or None if invalid.
+
+        A cohort may refill holes, extend the rank space, or do both at once when
+        its holes run up against the top.
+        """
+        inst = cls._instance
+        if inst is None:
+            return None
+        slots = list(range(rank_offset, rank_offset + cohort_size))
+        refillable = set(cls.get_inactive_ranks())
+        for rank in slots:
+            if rank < inst.effective_ep_size and rank not in refillable:
+                return None
+        return slots, max(inst.effective_ep_size, rank_offset + cohort_size)
+
+    @classmethod
+    def is_scaling(cls) -> bool:
+        """Return whether the elastic state machine still has work to do."""
+        return cls.is_scale_pending() or cls.has_inactive_ranks()
 
 
 def elastic_expanded_world_enabled() -> bool:
@@ -463,6 +586,69 @@ def get_healthy_expert_location_src_rank(
     )
 
 
+@dataclass(frozen=True)
+class ScaleCohortPlan:
+    """Which slots a matched cohort fills, or why it cannot be used."""
+
+    rank_offset: int
+    slots: List[int]
+    resulting_ep_size: int
+    error: Optional[str] = None
+
+
+def plan_joining_cohort(target_ep_size: int) -> Optional[ScaleCohortPlan]:
+    """Match a registered cohort against a requested EP size.
+
+    Returns None while no cohort has announced itself, and a plan carrying
+    ``error`` when the cohort that did announce cannot produce that size.
+    """
+    cohort = find_joining_cohort()
+    if cohort is None:
+        return None
+    rank_offset, cohort_size = cohort
+
+    resolved = ElasticEPStateManager.resolve_scale_slots(rank_offset, cohort_size)
+    if resolved is None:
+        return ScaleCohortPlan(
+            rank_offset=rank_offset,
+            slots=[],
+            resulting_ep_size=0,
+            error=(
+                f"Joining cohort at rank offset {rank_offset} claims "
+                f"{cohort_size} slots that are not free to fill"
+            ),
+        )
+
+    slots, resulting_ep_size = resolved
+    if resulting_ep_size != target_ep_size:
+        return ScaleCohortPlan(
+            rank_offset=rank_offset,
+            slots=[],
+            resulting_ep_size=resulting_ep_size,
+            error=(
+                f"Requested target EP size {target_ep_size} does not match the "
+                f"joining cohort, which yields EP size {resulting_ep_size}"
+            ),
+        )
+    return ScaleCohortPlan(
+        rank_offset=rank_offset,
+        slots=slots,
+        resulting_ep_size=resulting_ep_size,
+    )
+
+
+def auto_rank_recovery_supported() -> bool:
+    """Whether in-place rank recovery can run.
+
+    Recovery indexes ranks through the launch-time TP groups, and those exclude
+    every rank admitted by a scale-up, so their indices stop matching global
+    ranks once the world has grown. After a scale-up, holes are refilled by
+    pointing a joining cohort at them instead.
+    """
+    inst = ElasticEPStateManager.instance()
+    return inst is None or not inst.has_scaled
+
+
 def maybe_recover_ep_ranks(
     *,
     tp_group: parallel_state.GroupCoordinator,
@@ -501,7 +687,7 @@ def maybe_recover_ep_ranks(
                 invoked_in_elastic_ep_rejoin_path=False
             ),
         )
-        ElasticEPStateManager.instance().reset()
+        ElasticEPStateManager.mark_ranks_active(ranks_to_recover)
         logger.info(f"recover ranks {ranks_to_recover} done")
         return True
 

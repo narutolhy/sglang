@@ -5508,12 +5508,14 @@ class Scheduler(
             max_ep_size,
         )
 
-        if new_ep_size <= old_ep_size:
+        refilling = ElasticEPStateManager.has_inactive_ranks()
+        if new_ep_size < old_ep_size or (new_ep_size == old_ep_size and not refilling):
             return ScaleElasticEPReqOutput(
                 success=False,
                 message=(
                     f"new_ep_size ({new_ep_size}) must be greater than current "
-                    f"effective_ep_size ({old_ep_size})."
+                    f"effective_ep_size ({old_ep_size}); pass the unchanged size "
+                    "only to refill slots left by departed ranks."
                 ),
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
@@ -5528,7 +5530,7 @@ class Scheduler(
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
             )
-        if ElasticEPStateManager.is_scaling():
+        if ElasticEPStateManager.is_scale_pending():
             return ScaleElasticEPReqOutput(
                 success=False,
                 message=(

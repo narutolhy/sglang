@@ -267,9 +267,15 @@ def _init_parallel_groups(
     is_ep_joiner = get_exec().moe.is_ep_joiner
     is_scale_joiner = get_exec().moe.is_ep_scale_joiner
     rank_offset = get_parallel().ep_join_rank_offset if is_scale_joiner else 0
-    world_size = (
-        rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
-    )
+    if is_scale_joiner:
+        # A cohort refilling a departed cohort's slots joins a world that is
+        # already wider than the ranks it owns.
+        world_size = max(
+            rank_offset + tp_size * pp_size,
+            get_parallel().ep_join_world_size or 0,
+        )
+    else:
+        world_size = tp_size * pp_size
     rank = rank_offset + tp_size * pp_rank + tp_rank
 
     init_distributed_environment(

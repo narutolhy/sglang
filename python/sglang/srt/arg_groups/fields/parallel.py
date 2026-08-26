@@ -264,6 +264,19 @@ class Parallel(msgspec.Struct):
             cli_name="--elastic-ep-join-rank-offset",
         ),
     ] = 0
+    ep_join_world_size: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Current effective EP size of the deployment a scale joiner is "
+                "joining. Only needed when refilling slots left by departed "
+                "ranks. Defaults to --elastic-ep-join-rank-offset plus the "
+                "joining group's TP size, which is what append-only growth "
+                "produces."
+            ),
+            cli_name="--elastic-ep-join-world-size",
+        ),
+    ] = None
     elastic_ep_initial_size: A[
         Optional[int],
         "EP size used to define the immutable per-rank expert storage layout. "
