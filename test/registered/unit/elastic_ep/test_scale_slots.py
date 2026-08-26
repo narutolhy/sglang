@@ -16,6 +16,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     ScaleCohortPlan,
     clear_scale_cohort,
     find_joining_cohort,
+    maybe_rebalance_after_rank_fault,
     plan_joining_cohort,
     register_scale_cohort,
 )
@@ -362,6 +363,64 @@ class TestScaleCohortAnnouncements(CustomTestCase):
 
         clear_scale_cohort(40)
         self.assertIsNone(find_joining_cohort())
+
+
+class _FakeEPLBManager:
+    def __init__(self):
+        self.rebalance_count = 0
+
+    def rebalance(self):
+        self.rebalance_count += 1
+        yield
+
+
+class TestRankFaultPublication(CustomTestCase):
+    """The CPU snapshot the DP controller routes on.
+
+    Invariants:
+    - A fault advances the snapshot whether or not EPLB is configured. Elastic
+      EP does not require --enable-eplb, and the DP controller only learns which
+      ranks are serving from what the scheduler publishes off this snapshot.
+    - A fault is reported once, not on every forward that follows it.
+    """
+
+    def setUp(self):
+        self.addCleanup(setattr, ElasticEPStateManager, "_instance", None)
+        self.state = _make_state(effective_ep_size=40, max_ep_size=64)
+        ElasticEPStateManager._instance = self.state
+
+    def _fault(self, ranks):
+        for rank in ranks:
+            self.state.active_ranks[rank] = 0
+
+    def test_healthy_state_reports_nothing(self):
+        self.assertFalse(maybe_rebalance_after_rank_fault(eplb_manager=None))
+
+    def test_fault_without_eplb_still_advances_the_snapshot(self):
+        self._fault(range(32, 40))
+        self.assertEqual(self.state.active_ranks_cpu[32:40].sum().item(), 8)
+
+        self.assertFalse(maybe_rebalance_after_rank_fault(eplb_manager=None))
+
+        self.assertEqual(self.state.active_ranks_cpu[32:40].sum().item(), 0)
+        self.assertEqual(
+            ElasticEPStateManager.get_inactive_ranks(), list(range(32, 40))
+        )
+
+    def test_fault_with_eplb_rebalances_and_asks_for_a_rerun(self):
+        manager = _FakeEPLBManager()
+        self._fault([36])
+
+        self.assertTrue(maybe_rebalance_after_rank_fault(eplb_manager=manager))
+
+        self.assertEqual(manager.rebalance_count, 1)
+        self.assertEqual(self.state.active_ranks_cpu[36].item(), 0)
+
+    def test_the_same_fault_is_not_reported_twice(self):
+        self._fault([36])
+        maybe_rebalance_after_rank_fault(eplb_manager=None)
+
+        self.assertFalse(maybe_rebalance_after_rank_fault(eplb_manager=None))
 
 
 if __name__ == "__main__":

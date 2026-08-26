@@ -694,12 +694,18 @@ def maybe_recover_ep_ranks(
     return False
 
 
-def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
+def maybe_rebalance_after_rank_fault(*, eplb_manager: Optional[EPLBManager]) -> bool:
     elastic_ep_state = ElasticEPStateManager.instance()
     if elastic_ep_state is None or elastic_ep_state.is_active_equal_last():
         return False
     elastic_ep_state.snapshot_active_to_last()
     elastic_ep_state.sync_active_to_cpu()
+    if eplb_manager is None:
+        # Elastic EP does not require --enable-eplb. With no manager there is
+        # nothing to redistribute, but the CPU snapshot still has to advance:
+        # it is what the scheduler publishes and the DP controller routes on.
+        logger.info("Rank fault observed; EPLB is disabled, nothing to rebalance")
+        return False
     logger.info("EPLB due to rank faults")
     gen = eplb_manager.rebalance()
     while True:
