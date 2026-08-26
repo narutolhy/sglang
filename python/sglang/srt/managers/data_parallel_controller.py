@@ -137,6 +137,12 @@ class DPBudget:
         return target_rank
 
 
+# Sending to a worker only blocks when its PULL peer is gone: SNDHWM is 0, so a
+# live but slow scheduler queues without bound and never applies backpressure.
+# That makes a short timeout a liveness probe rather than a load signal.
+WORKER_SEND_TIMEOUT_MS = 1000
+
+
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 
@@ -200,6 +206,11 @@ class DataParallelController:
         self.scheduler_procs = []
         self.workers: list[zmq.Socket | None] = [None] * self.max_dp_size
         self.status: list[bool] = list(self.dp_active)
+        # Slots whose scheduler stopped accepting sends. Tracked separately from
+        # `status` because a send failure is observed here, several batches
+        # before the ranks report the fault back through ActiveRanksOutput.
+        self.send_failed: list[bool] = [False] * self.max_dp_size
+        self._last_reported_status: list[bool] = list(self.dp_active)
         self._active_workers: list[int] = list(range(self.launch_dp_size))
         self._active_count_cache: int = self.launch_dp_size
 
@@ -228,16 +239,48 @@ class DataParallelController:
         if get_observability().enable_metrics:
             start_cpu_monitor_thread("data_parallel_controller")
 
+    def _adopt_worker_socket(self, slot: int, socket: zmq.Socket) -> None:
+        """Register a worker PUSH socket, bounding how long a send may block."""
+        socket.setsockopt(zmq.SNDTIMEO, WORKER_SEND_TIMEOUT_MS)
+        self.workers[slot] = socket
+
+    def _send_to_worker(self, slot: int, obj) -> bool:
+        """Send one object to one worker. Returns False if it is unreachable.
+
+        A departed scheduler leaves its PUSH socket with no peer, and ZMQ blocks
+        such a send indefinitely rather than failing it. This loop is single
+        threaded, so that stalls dispatch for every rank including the healthy
+        ones, and stops the controller from ever processing the rank-status
+        updates that would have routed around the fault.
+        """
+        worker = self.workers[slot]
+        if worker is None:
+            return False
+        try:
+            sock_send(worker, obj)
+            return True
+        except zmq.Again:
+            if not self.send_failed[slot]:
+                logger.error(
+                    "[DPC] worker slot %d did not accept a send within %d ms; "
+                    "treating it as departed and routing around it",
+                    slot,
+                    WORKER_SEND_TIMEOUT_MS,
+                )
+            self.send_failed[slot] = True
+            self._refresh_active_workers()
+            return False
+
     def send_to_all_workers(self, obj):
         for i, worker in enumerate(self.workers):
             if worker is not None and self.status[i]:
-                sock_send(worker, obj)
+                self._send_to_worker(i, obj)
 
     def send_control_message(self, obj):
-        for i in self._active_workers[:: self.control_message_step]:
-            worker = self.workers[i]
-            if worker is not None:
-                sock_send(worker, obj)
+        # Snapshot the targets: a failed send rebuilds the active-worker list.
+        targets = list(self._active_workers[:: self.control_message_step])
+        for i in targets:
+            self._send_to_worker(i, obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if get_exec().moe.elastic_ep_backend is not None:
@@ -253,6 +296,7 @@ class DataParallelController:
                 self.dp_active[i] and bool(ranks.status[i])
                 for i in range(self.max_dp_size)
             ]
+            self._clear_send_failures_on_recovery(ranks.status)
             self._refresh_active_workers()
             return
         if len(ranks.status) != self.max_dp_size:
@@ -264,6 +308,7 @@ class DataParallelController:
             )
             return
         self.status = list(ranks.status)
+        self._clear_send_failures_on_recovery(ranks.status)
 
     def add_elastic_workers(self, slot_offset: int, slot_count: int):
         """Activate a range of pre-bound worker slots."""
@@ -276,6 +321,9 @@ class DataParallelController:
             )
 
         for slot in range(slot_offset, end):
+            # A refilled slot was already marked active by its first admission;
+            # what retired it was the send failure, so that is what to clear.
+            self.send_failed[slot] = False
             if self.dp_active[slot]:
                 logger.debug(
                     "[Elastic EP] add_elastic_workers: slot %d already active; "
@@ -300,10 +348,26 @@ class DataParallelController:
         )
 
     def _refresh_active_workers(self) -> None:
+        # Rebind rather than mutate: dispatchers hold this list while they walk
+        # it, and a send failure inside that walk refreshes it.
         self._active_workers = [
-            i for i, active in enumerate(self.dp_active) if active and self.status[i]
+            i
+            for i, active in enumerate(self.dp_active)
+            if active and self.status[i] and not self.send_failed[i]
         ]
         self._active_count_cache = len(self._active_workers)
+
+    def _clear_send_failures_on_recovery(self, reported: list[bool]) -> None:
+        """Readmit a slot when its rank is newly reported healthy.
+
+        Only on the rising edge: the status vector is republished every batch, so
+        comparing against the last report is what keeps a departed slot out
+        instead of readmitting it in time to stall the next dispatch.
+        """
+        for slot, now_active in enumerate(reported):
+            if now_active and not self._last_reported_status[slot]:
+                self.send_failed[slot] = False
+        self._last_reported_status = [bool(x) for x in reported]
 
     def refresh_load_budget(self):
         # Throttle to at most once per 20ms.  When a burst of requests
@@ -400,11 +464,14 @@ class DataParallelController:
             )
 
             if get_parallel().node_rank == 0:
-                self.workers[dp_rank] = get_zmq_socket(
-                    self.context,
-                    zmq.PUSH,
-                    tmp_port_args.scheduler_input_ipc_name,
-                    True,
+                self._adopt_worker_socket(
+                    dp_rank,
+                    get_zmq_socket(
+                        self.context,
+                        zmq.PUSH,
+                        tmp_port_args.scheduler_input_ipc_name,
+                        True,
+                    ),
                 )
 
         # Free all sockets before starting the threads to launch TP workers
@@ -585,7 +652,7 @@ class DataParallelController:
                     self.context, zmq.PUSH, host=bind_host
                 )
                 worker_ports.append(worker_port)
-                self.workers[slot] = worker_socket
+                self._adopt_worker_socket(slot, worker_socket)
                 logger.debug(
                     "Assigned port %s to worker slot %s on host %s",
                     worker_port,
@@ -760,7 +827,8 @@ class DataParallelController:
             ):
                 raise ValueError(f"DP rank {rank} is not active.")
             logger.debug(f"Direct routing to DP rank {rank}")
-            sock_send(self.workers[rank], req)
+            if not self._send_to_worker(rank, req):
+                raise ValueError(f"DP rank {rank} is not reachable.")
             return True
         return False
 
@@ -775,9 +843,8 @@ class DataParallelController:
         while attempts < len(active):
             slot = active[self.round_robin_counter % len(active)]
             self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
-            if self.status[slot]:
+            if self.status[slot] and self._send_to_worker(slot, req):
                 logger.debug(f"Choose worker {slot}")
-                sock_send(self.workers[slot], req)
                 return
             attempts += 1
         raise RuntimeError(
@@ -794,13 +861,22 @@ class DataParallelController:
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        sock_send(self.workers[target_rank], req)
+        # Not rerouted: the bootstrap room pins this request to a specific rank,
+        # so another rank is not an equivalent destination.
+        if not self._send_to_worker(target_rank, req):
+            raise RuntimeError(
+                f"DP rank {target_rank} for bootstrap room {req.bootstrap_room} "
+                "is not reachable."
+            )
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        sock_send(self.workers[target_worker], req)
+        if not self._send_to_worker(target_worker, req):
+            # The load snapshot named a rank that has since departed; any
+            # healthy rank will do until the next snapshot drops it.
+            self.round_robin_scheduler(req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -809,7 +885,10 @@ class DataParallelController:
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
-        sock_send(self.workers[target_worker], req)
+        if not self._send_to_worker(target_worker, req):
+            # The load snapshot named a rank that has since departed; any
+            # healthy rank will do until the next snapshot drops it.
+            self.round_robin_scheduler(req)
 
     def event_loop(self):
         while True:

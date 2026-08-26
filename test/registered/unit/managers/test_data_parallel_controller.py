@@ -5,10 +5,12 @@ test/registered/disaggregation/test_disaggregation_dp_attention.py.
 
 Fragility: scheduler tests bypass `DataParallelController.__init__` via
 `__new__` and inject only the attrs the schedulers read (`workers`, `status`,
-`_active_workers`, `round_robin_counter`, `dp_budget`). Update `_make_controller`
-if a scheduler starts reading another attr. `maybe_external_dp_rank_routing`
-is exercised as the real method, no mock. The refresh-throttle tests inject
-`load_snapshot_reader` and `_last_refresh_time` on top of those.
+`send_failed`, `_last_reported_status`, `dp_active`, `max_dp_size`,
+`_active_workers`, `_active_count_cache`, `round_robin_counter`, `dp_budget`).
+Update `_make_controller` if a scheduler starts reading another attr.
+`maybe_external_dp_rank_routing` is exercised as the real method, no mock. The
+refresh-throttle tests inject `load_snapshot_reader` and `_last_refresh_time`
+on top of those.
 """
 
 import time
@@ -17,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import msgspec.structs
+import zmq
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -49,10 +52,28 @@ def _make_controller(dp_size: int) -> DataParallelController:
     ctl = DataParallelController.__new__(DataParallelController)
     ctl.workers = [MagicMock(name=f"worker_{i}") for i in range(dp_size)]
     ctl.status = [True] * dp_size
+    ctl.max_dp_size = dp_size
+    ctl.launch_dp_size = dp_size
+    ctl.dp_active = [True] * dp_size
+    ctl.send_failed = [False] * dp_size
+    ctl._last_reported_status = [True] * dp_size
     ctl._active_workers = list(range(dp_size))
+    ctl._active_count_cache = dp_size
+    ctl.control_message_step = 1
     ctl.round_robin_counter = 0
     ctl.dp_budget = DPBudget(dp_size=dp_size)
     return ctl
+
+
+def _kill_worker(ctl: DataParallelController, slot: int) -> None:
+    """Make one worker behave like a scheduler that has gone away.
+
+    ZMQ raises Again on a PUSH whose peer is missing only once SNDTIMEO is set;
+    without the timeout the real socket blocks forever, which is the failure this
+    guards against.
+    """
+    ctl.workers[slot].send_pyobj.side_effect = zmq.Again()
+    ctl.workers[slot].send.side_effect = zmq.Again()
 
 
 def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
@@ -350,6 +371,110 @@ class TestRefreshLoadBudgetThrottle(CustomTestCase):
             after_burst,
             "a stale-timestamp snapshot must not wipe the speculative state",
         )
+
+
+class TestDispatchToDepartedWorker(CustomTestCase):
+    """Routing when a scheduler process is gone.
+
+    Invariants:
+    - A departed worker never stalls dispatch. Its PUSH socket has no peer, and
+      ZMQ blocks such a send forever, which would freeze the single-threaded
+      controller for every rank and stop it from processing the rank-status
+      updates that route around the fault.
+    - A departed slot is probed once, not once per request.
+    - Requests pinned to a specific rank fail loudly rather than move.
+    - A republished status vector does not readmit a departed slot; a genuine
+      recovery does.
+    """
+
+    def test_request_lands_on_a_healthy_worker(self):
+        ctl = _make_controller(8)
+        _kill_worker(ctl, 3)
+
+        for _ in range(8):
+            ctl.round_robin_scheduler(_req())
+
+        self.assertEqual(ctl.workers[3].send_pyobj.call_count, 1)  # refused
+        accepted = sum(
+            worker.send_pyobj.call_count
+            for slot, worker in enumerate(ctl.workers)
+            if slot != 3
+        )
+        self.assertEqual(accepted, 8)  # every request still got delivered
+        self.assertTrue(ctl.send_failed[3])
+        self.assertNotIn(3, ctl._active_workers)
+
+    def test_departed_worker_is_probed_once(self):
+        """Otherwise every request pays the send timeout again."""
+        ctl = _make_controller(8)
+        _kill_worker(ctl, 3)
+
+        for _ in range(40):
+            ctl.round_robin_scheduler(_req())
+
+        self.assertEqual(ctl.workers[3].send_pyobj.call_count, 1)
+
+    def test_a_whole_departed_cohort_is_survived(self):
+        """Round robin is sequential, so a contiguous cohort is hit in a run."""
+        ctl = _make_controller(64)
+        for slot in range(32, 40):
+            _kill_worker(ctl, slot)
+        ctl.round_robin_counter = 32
+
+        for _ in range(64):
+            ctl.round_robin_scheduler(_req())
+
+        self.assertEqual(
+            [i for i, failed in enumerate(ctl.send_failed) if failed],
+            list(range(32, 40)),
+        )
+        self.assertEqual(len(ctl._active_workers), 56)
+
+    def test_pinned_rank_is_not_silently_rerouted(self):
+        ctl = _make_controller(8)
+        _kill_worker(ctl, 3)
+
+        with self.assertRaises(ValueError):
+            ctl.maybe_external_dp_rank_routing(_req(routed_dp_rank=3))
+        self.assertTrue(ctl.send_failed[3])
+
+    def test_republished_status_does_not_readmit_a_departed_slot(self):
+        ctl = _make_controller(8)
+        _kill_worker(ctl, 3)
+        for _ in range(8):
+            ctl.round_robin_scheduler(_req())
+
+        # The ranks have not observed the fault yet and still report everyone up.
+        ctl.update_active_ranks(SimpleNamespace(status=[True] * 8))
+
+        self.assertTrue(ctl.send_failed[3])
+        self.assertNotIn(3, ctl._active_workers)
+
+    def test_a_recovered_rank_is_readmitted(self):
+        ctl = _make_controller(8)
+        _kill_worker(ctl, 3)
+        for _ in range(8):
+            ctl.round_robin_scheduler(_req())
+
+        down = [True] * 8
+        down[3] = False
+        ctl.update_active_ranks(SimpleNamespace(status=down))
+        ctl.workers[3].send_pyobj.side_effect = None
+        ctl.workers[3].send.side_effect = None
+        ctl.update_active_ranks(SimpleNamespace(status=[True] * 8))
+
+        self.assertFalse(ctl.send_failed[3])
+        self.assertIn(3, ctl._active_workers)
+
+    def test_broadcast_skips_a_departed_worker(self):
+        ctl = _make_controller(8)
+        _kill_worker(ctl, 3)
+
+        ctl.send_to_all_workers("control")
+
+        for slot, worker in enumerate(ctl.workers):
+            self.assertEqual(worker.send_pyobj.call_count, 1, f"slot {slot}")
+        self.assertTrue(ctl.send_failed[3])
 
 
 if __name__ == "__main__":
