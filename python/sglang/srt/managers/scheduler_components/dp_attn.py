@@ -74,12 +74,20 @@ def _resolve_elastic_world_dp_size(
             f"local_forward_mode={local_forward_mode}"
         )
     if live_dp_size > world_size:
-        raise RuntimeError(
-            "[Elastic EP] WORLD MLP sync dp_size exceeds WORLD size: "
-            f"rank={torch.distributed.get_rank(group)} "
-            f"live_dp_size={live_dp_size} world_size={world_size} "
-            f"effective_ep_size={effective_ep_size}"
-        )
+        # A departed rank leaves the group smaller than the slot space, which is
+        # the ordinary state between a fault and its refill. The all-reduce
+        # gather writes each rank into its own slot and fills whatever nobody
+        # wrote with the IDLE fallback, so slots belonging to inactive ranks
+        # cost nothing. Only an unexplained shortfall is a real inconsistency.
+        inactive_slots = len(ElasticEPStateManager.get_inactive_ranks())
+        if live_dp_size - world_size > inactive_slots:
+            raise RuntimeError(
+                "[Elastic EP] WORLD MLP sync dp_size exceeds WORLD size: "
+                f"rank={torch.distributed.get_rank(group)} "
+                f"live_dp_size={live_dp_size} world_size={world_size} "
+                f"effective_ep_size={effective_ep_size} "
+                f"inactive_slots={inactive_slots}"
+            )
 
     return live_dp_size
 
