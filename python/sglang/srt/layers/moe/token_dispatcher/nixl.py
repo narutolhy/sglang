@@ -111,6 +111,47 @@ class NixlEPBuffer:
         )
 
     @classmethod
+    def _refill_ranks(cls, state, ranks: list) -> None:
+        """Point refilled slots at the processes that now own them.
+
+        ``connect_ranks`` skips a rank it is already connected to
+        (``if remote_rank == rank or _is_rank_connected(remote_rank)) continue;``),
+        so a refilled slot keeps the departed process's endpoints and is marked
+        failed again on the next combine. The endpoints have to be dropped first.
+
+        ``disconnect_ranks`` erases by value, not by position, and every per-rank
+        structure behind it is keyed by global rank id -- so a slot anywhere in
+        the connected range can be replaced, not only one at the end. Its
+        docstring says the ranks "must be at the end of the current remote_ranks
+        list"; the implementation does not require that, and asserting
+        ``_is_rank_connected`` per rank is what it actually enforces. This mirrors
+        those two asserts rather than the docstring, so a caller that would abort
+        the process is refused here instead.
+
+        Both calls are collective: each rank publishes ``NIXL_EP/<self>`` and
+        waits for every rank it names, so a refill only completes once the
+        replacement processes are connecting too.
+        """
+        connected = state.connected_ep_size or 0
+        local_rank = state.buffer.rank
+        # EP_HOST_ASSERT(removed_rank != rank) and EP_HOST_ASSERT(
+        # _is_rank_connected(removed_rank)) abort the process, so screen for both.
+        unconnected = [r for r in ranks if not 0 <= r < connected or r == local_rank]
+        if not ranks or unconnected:
+            logger.error(
+                "[Elastic EP][nixl] cannot refill ranks=%s: %s not connected "
+                "(connected_ep_size=%d, local rank=%d); leaving them masked",
+                ranks,
+                unconnected or "empty rank list",
+                connected,
+                local_rank,
+            )
+            return
+        logger.info("[Elastic EP][nixl] reconnecting refilled ranks=%s", ranks)
+        state.buffer.disconnect_ranks(ranks)
+        cls._connect_ranks(state, ranks, tag="refill")
+
+    @classmethod
     def _update_connections(cls, state, scale_to: int) -> None:
         new_ranks = list(range(state.connected_ep_size, scale_to))
         cls._connect_ranks(state, new_ranks, tag="update")
@@ -135,7 +176,7 @@ class NixlEPBuffer:
             ):
                 cls._update_connections(state, state.scale_to)
             if state.pending_reconnect:
-                cls._connect_ranks(state, state.pending_reconnect, tag="refill")
+                cls._refill_ranks(state, state.pending_reconnect)
                 state.pending_reconnect = None
             return state.buffer
 
