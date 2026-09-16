@@ -244,6 +244,7 @@ class ExpertLocationMetadata:
                 ep_size = max(
                     ep_size,
                     get_parallel().ep_join_rank_offset + get_parallel().tp_size,
+                    server_args.elastic_ep_join_world_size or 0,
                 )
             num_physical_experts, num_local_physical_experts = (
                 _compute_elastic_expert_layout(
